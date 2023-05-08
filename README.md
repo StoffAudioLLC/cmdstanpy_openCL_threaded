@@ -1,4 +1,4 @@
-# CmdStanPy
+# CmdStanPy with OpenCL and Multitreading Command
 
 [![codecov](https://codecov.io/gh/stan-dev/cmdstanpy/branch/master/graph/badge.svg)](https://codecov.io/gh/stan-dev/cmdstanpy)
 
