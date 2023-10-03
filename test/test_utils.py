@@ -1,6 +1,5 @@
 """utils test"""
 
-import collections.abc
 import contextlib
 import io
 import json
@@ -18,7 +17,6 @@ from test import check_present, mark_windows_only, raises_nested
 from unittest import mock
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from cmdstanpy import _DOT_CMDSTAN, _TMPDIR
@@ -26,8 +24,6 @@ from cmdstanpy.model import CmdStanModel
 from cmdstanpy.progress import _disable_progress, allow_show_progress
 from cmdstanpy.utils import (
     EXTENSION,
-    BaseType,
-    MaybeDictToFilePath,
     SanitizedOrTmpFilePath,
     check_sampler_csv,
     cmdstan_path,
@@ -37,18 +33,17 @@ from cmdstanpy.utils import (
     flatten_chains,
     get_latest_cmdstan,
     install_cmdstan,
-    parse_method_vars,
     parse_rdump_value,
-    parse_stan_vars,
     pushd,
     read_metric,
     rload,
     set_cmdstan_path,
+    stancsv,
     validate_cmdstan_path,
     validate_dir,
     windows_short_path,
-    write_stan_json,
 )
+from cmdstanpy.utils.filesystem import temp_inits, temp_single_json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATAFILES_PATH = os.path.join(HERE, 'data')
@@ -75,7 +70,9 @@ def test_default_path() -> None:
         assert 'CMDSTAN' in os.environ
 
 
-def test_non_spaces_location() -> None:
+@pytest.mark.parametrize("bad_dir", ["bad dir", "bad~dir"])
+@pytest.mark.parametrize("bad_name", ["bad name", "bad~name"])
+def test_non_special_chars_location(bad_dir: str, bad_name: str) -> None:
     with tempfile.TemporaryDirectory(
         prefix="cmdstan_tests", dir=_TMPDIR
     ) as tmpdir:
@@ -86,10 +83,10 @@ def test_non_spaces_location() -> None:
             assert not is_changed
 
         # prepare files for test
-        bad_path = os.path.join(tmpdir, 'bad dir')
+        bad_path = os.path.join(tmpdir, bad_dir)
         os.makedirs(bad_path, exist_ok=True)
         stan = os.path.join(DATAFILES_PATH, 'bernoulli.stan')
-        stan_bad = os.path.join(bad_path, 'bad name.stan')
+        stan_bad = os.path.join(bad_path, bad_name)
         shutil.copy(stan, stan_bad)
 
         stan_copied = None
@@ -98,7 +95,20 @@ def test_non_spaces_location() -> None:
                 stan_copied = pth
                 assert os.path.exists(stan_copied)
                 assert ' ' not in stan_copied
-                assert is_changed
+
+                # Determine if the file should have been copied, i.e., we either
+                # are on a unix-ish system or on windows, the path contains a
+                # space, and there is no short path.
+                if platform.system() == 'Windows':
+                    should_change = ' ' in bad_name or (
+                        ' ' in bad_path
+                        and not os.path.exists(windows_short_path(bad_path))
+                    )
+                else:
+                    should_change = True
+                    assert '~' not in stan_copied
+
+                assert is_changed == should_change
                 raise RuntimeError
         except RuntimeError:
             pass
@@ -234,148 +244,47 @@ def test_dict_to_file() -> None:
     file_good = os.path.join(DATAFILES_PATH, 'bernoulli_output_1.csv')
     dict_good = {'a': 0.5}
     created_tmp = None
-    with MaybeDictToFilePath(file_good, dict_good) as (fg1, fg2):
+
+    with temp_single_json(file_good) as fg1:
         assert os.path.exists(fg1)
+    assert os.path.exists(file_good)
+
+    with temp_single_json(dict_good) as fg2:
         assert os.path.exists(fg2)
         with open(fg2) as fg2_d:
             assert json.load(fg2_d) == dict_good
         created_tmp = fg2
-    assert os.path.exists(file_good)
+
     assert not os.path.exists(created_tmp)
 
-    with pytest.raises(ValueError):
-        with MaybeDictToFilePath(123, dict_good) as (fg1, fg2):
+    with pytest.raises(AttributeError):
+        with temp_single_json(123) as _:
             pass
 
 
-def test_write_stan_json() -> None:
-    def cmp(d1, d2):
-        assert d1.keys() == d2.keys()
-        for k in d1:
-            data_1 = d1[k]
-            data_2 = d2[k]
-            if isinstance(data_2, collections.abc.Collection):
-                data_2 = np.asarray(data_2).tolist()
-            # np properly handles NaN equality
-            np.testing.assert_equal(data_1, data_2)
+def test_temp_inits():
+    dict_good = {'a': 0.5}
+    with temp_inits([dict_good, dict_good]) as base_file:
+        fg1 = base_file[:-5] + '_1.json'
+        fg2 = base_file[:-5] + '_2.json'
+        assert os.path.exists(fg1)
+        assert os.path.exists(fg2)
+        with open(fg1) as fg1_d:
+            assert json.load(fg1_d) == dict_good
+        with open(fg2) as fg2_d:
+            assert json.load(fg2_d) == dict_good
+        created_tmp = (fg1, fg2)
 
-    dict_list = {'a': [1.0, 2.0, 3.0]}
-    file_list = os.path.join(_TMPDIR, 'list.json')
-    write_stan_json(file_list, dict_list)
-    with open(file_list) as fd:
-        cmp(json.load(fd), dict_list)
+    assert not os.path.exists(created_tmp[0])
+    assert not os.path.exists(created_tmp[1])
 
-    arr = np.repeat(3, 4)
-    dict_vec = {'a': arr}
-    file_vec = os.path.join(_TMPDIR, 'vec.json')
-    write_stan_json(file_vec, dict_vec)
-    with open(file_vec) as fd:
-        cmp(json.load(fd), dict_vec)
-
-    dict_bool = {'a': False}
-    file_bool = os.path.join(_TMPDIR, 'bool.json')
-    write_stan_json(file_bool, dict_bool)
-    with open(file_bool) as fd:
-        cmp(json.load(fd), {'a': 0})
-
-    dict_none = {'a': None}
-    file_none = os.path.join(_TMPDIR, 'none.json')
-    write_stan_json(file_none, dict_none)
-    with open(file_none) as fd:
-        cmp(json.load(fd), dict_none)
-
-    series = pd.Series(arr)
-    dict_vec_pd = {'a': series}
-    file_vec_pd = os.path.join(_TMPDIR, 'vec_pd.json')
-    write_stan_json(file_vec_pd, dict_vec_pd)
-    with open(file_vec_pd) as fd:
-        cmp(json.load(fd), dict_vec_pd)
-
-    df_vec = pd.DataFrame(dict_list)
-    file_pd = os.path.join(_TMPDIR, 'pd.json')
-    write_stan_json(file_pd, df_vec)
-    with open(file_pd) as fd:
-        cmp(json.load(fd), dict_list)
-
-    dict_zero_vec = {'a': []}
-    file_zero_vec = os.path.join(_TMPDIR, 'empty_vec.json')
-    write_stan_json(file_zero_vec, dict_zero_vec)
-    with open(file_zero_vec) as fd:
-        cmp(json.load(fd), dict_zero_vec)
-
-    dict_zero_matrix = {'a': [[], [], []]}
-    file_zero_matrix = os.path.join(_TMPDIR, 'empty_matrix.json')
-    write_stan_json(file_zero_matrix, dict_zero_matrix)
-    with open(file_zero_matrix) as fd:
-        cmp(json.load(fd), dict_zero_matrix)
-
-    arr = np.zeros(shape=(5, 0))
-    dict_zero_matrix = {'a': arr}
-    file_zero_matrix = os.path.join(_TMPDIR, 'empty_matrix.json')
-    write_stan_json(file_zero_matrix, dict_zero_matrix)
-    with open(file_zero_matrix) as fd:
-        cmp(json.load(fd), dict_zero_matrix)
-
-    arr = np.zeros(shape=(2, 3, 4))
-    assert isinstance(arr, np.ndarray)
-    assert arr.shape == (2, 3, 4)
-
-    dict_3d_matrix = {'a': arr}
-    file_3d_matrix = os.path.join(_TMPDIR, '3d_matrix.json')
-    write_stan_json(file_3d_matrix, dict_3d_matrix)
-    with open(file_3d_matrix) as fd:
-        cmp(json.load(fd), dict_3d_matrix)
-
-    scalr = np.int32(1)
-    assert type(scalr).__module__ == 'numpy'
-    dict_scalr = {'a': scalr}
-    file_scalr = os.path.join(_TMPDIR, 'scalr.json')
-    write_stan_json(file_scalr, dict_scalr)
-    with open(file_scalr) as fd:
-        cmp(json.load(fd), dict_scalr)
-
-    # custom Stan serialization
-    dict_inf_nan = {
-        'a': np.array(
-            [
-                [-np.inf, np.inf, np.NaN],
-                [-float('inf'), float('inf'), float('NaN')],
-                [
-                    np.float32(-np.inf),
-                    np.float32(np.inf),
-                    np.float32(np.NaN),
-                ],
-                [1e200 * -1e200, 1e220 * 1e200, -np.nan],
-            ]
-        )
-    }
-    dict_inf_nan_exp = {'a': [[-np.inf, np.inf, np.nan]] * 4}
-    file_fin = os.path.join(_TMPDIR, 'inf.json')
-    write_stan_json(file_fin, dict_inf_nan)
-    with open(file_fin) as fd:
-        cmp(
-            json.load(fd),
-            dict_inf_nan_exp,
-        )
-
-    dict_complex = {'a': np.array([np.complex64(3), 3 + 4j])}
-    dict_complex_exp = {'a': [[3, 0], [3, 4]]}
-    file_complex = os.path.join(_TMPDIR, 'complex.json')
-    write_stan_json(file_complex, dict_complex)
-    with open(file_complex) as fd:
-        cmp(json.load(fd), dict_complex_exp)
-
-
-def test_write_stan_json_bad() -> None:
-    file_bad = os.path.join(_TMPDIR, 'bad.json')
-
-    dict_badtype = {'a': 'a string'}
-    with pytest.raises(TypeError):
-        write_stan_json(file_bad, dict_badtype)
-
-    dict_badtype_nested = {'a': ['a string']}
     with pytest.raises(ValueError):
-        write_stan_json(file_bad, dict_badtype_nested)
+        with temp_inits([123]) as _:
+            pass
+
+    with pytest.raises(ValueError):
+        with temp_inits([dict_good], allow_multiple=False) as _:
+            pass
 
 
 def test_check_sampler_csv_1() -> None:
@@ -666,128 +575,6 @@ def test_parse_rdump_value() -> None:
     assert v_struct3[6, 1] == 15
 
 
-def test_parse_empty() -> None:
-    x = []
-    sampler_vars = parse_method_vars(x)
-    assert len(sampler_vars) == 0
-    stan_vars_dims, stan_vars_cols, stan_var_types = parse_stan_vars(x)
-    assert len(stan_vars_dims) == 0
-    assert len(stan_vars_cols) == 0
-    assert len(stan_var_types) == 0
-
-
-def test_parse_missing() -> None:
-    with pytest.raises(ValueError):
-        parse_method_vars(None)
-    with pytest.raises(ValueError):
-        parse_stan_vars(None)
-
-
-def test_parse_method_vars() -> None:
-    x = [
-        'lp__',
-        'accept_stat__',
-        'stepsize__',
-        'treedepth__',
-        'n_leapfrog__',
-        'divergent__',
-        'energy__',
-        'theta[1]',
-        'theta[2]',
-        'theta[3]',
-        'theta[4]',
-        'z_init[1]',
-        'z_init[2]',
-    ]
-    vars_dict = parse_method_vars(x)
-    assert len(vars_dict) == 7
-    assert vars_dict['lp__'] == (0,)
-    assert vars_dict['stepsize__'] == (2,)
-
-
-def test_parse_scalars() -> None:
-    x = ['lp__', 'foo']
-    dims_map, cols_map, _ = parse_stan_vars(x)
-    assert len(dims_map) == 1
-    assert dims_map['foo'] == ()
-    assert len(cols_map) == 1
-    assert cols_map['foo'] == (1,)
-
-    dims_map = {}
-    cols_map = {}
-    x = ['lp__', 'foo1', 'foo2']
-    dims_map, cols_map, _ = parse_stan_vars(x)
-    assert len(dims_map) == 2
-    assert dims_map['foo1'] == ()
-    assert dims_map['foo2'] == ()
-    assert len(cols_map) == 2
-    assert cols_map['foo1'] == (1,)
-    assert cols_map['foo2'] == (2,)
-
-    dims_map = {}
-    cols_map = {}
-    x = ['lp__', 'z[real]', 'z[imag]']
-    dims_map, cols_map, types_map = parse_stan_vars(x)
-    assert len(dims_map) == 1
-    assert dims_map['z'] == (2,)
-    assert types_map['z'] == BaseType.COMPLEX
-
-
-def test_parse_containers() -> None:
-    # demonstrates flaw in shortcut to get container dims
-    x = [
-        'lp__',
-        'accept_stat__',
-        'foo',
-        'phi[1]',
-        'phi[2]',
-        'phi[3]',
-        'phi[10]',
-        'bar',
-    ]
-    dims_map, cols_map, _ = parse_stan_vars(x)
-    assert len(dims_map) == 3
-    assert dims_map['foo'] == ()
-    assert dims_map['phi'] == (10,)  # sic
-    assert dims_map['bar'] == ()
-    assert len(cols_map) == 3
-    assert cols_map['foo'] == (2,)
-    assert cols_map['phi'] == (3, 4, 5, 6)
-    assert cols_map['bar'] == (7,)
-
-    x = [
-        'lp__',
-        'accept_stat__',
-        'foo',
-        'phi[1]',
-        'phi[2]',
-        'phi[3]',
-        'phi[10,10]',
-        'bar',
-    ]
-    dims_map = {}
-    cols_map = {}
-    dims_map, cols_map, _ = parse_stan_vars(x)
-    assert len(dims_map) == 3
-    assert dims_map['phi'] == (10, 10)
-    assert len(cols_map) == 3
-    assert cols_map['phi'] == (3, 4, 5, 6)
-
-    x = [
-        'lp__',
-        'accept_stat__',
-        'foo',
-        'phi[10,10,10]',
-    ]
-    dims_map = {}
-    cols_map = {}
-    dims_map, cols_map, _ = parse_stan_vars(x)
-    assert len(dims_map) == 2
-    assert dims_map['phi'] == (10, 10, 10)
-    assert len(cols_map) == 2
-    assert cols_map['phi'] == (3,)
-
-
 def test_capture_console() -> None:
     tmp = io.StringIO()
     do_command(cmd=['ls'], cwd=HERE, fd_out=tmp)
@@ -846,9 +633,7 @@ def test_bad_version(caplog: pytest.LogCaptureFixture) -> None:
 
 
 def test_interactive_extra_args(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING), mock.patch(
-        "sys.stdin", io.StringIO("9.99.9\n")
-    ):
+    with caplog.at_level(logging.WARNING):
         assert not install_cmdstan(version="2.29.2", interactive=True)
     check_present(
         caplog,
@@ -893,3 +678,24 @@ def test_show_progress_fns(caplog: pytest.LogCaptureFixture) -> None:
     # msg should only be printed once per session - check not found
     assert 'Disabling progress bars for this session' not in msgs
     assert not allow_show_progress()
+
+
+def test_munge_varnames() -> None:
+    var = 'y'
+    assert stancsv.munge_varname(var) == 'y'
+    var = 'y.2'
+    assert stancsv.munge_varname(var) == 'y[2]'
+    var = 'y.2.3'
+    assert stancsv.munge_varname(var) == 'y[2,3]'
+
+    var = 'y:2'
+    assert stancsv.munge_varname(var) == 'y.2'
+    var = 'y:2:3'
+    assert stancsv.munge_varname(var) == 'y.2.3'
+    var = 'y:2.1'
+    assert stancsv.munge_varname(var) == 'y.2[1]'
+    var = 'y.1:2'
+    assert stancsv.munge_varname(var) == 'y[1].2'
+
+    var = 'y.2.3:1.2:5:6'
+    assert stancsv.munge_varname(var) == 'y[2,3].1[2].5.6'

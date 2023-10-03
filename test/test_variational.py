@@ -92,11 +92,13 @@ def test_variables() -> None:
         'mu[1]',
         'mu[2]',
     )
-    assert len(variational.metadata.stan_vars_dims) == 1
-    assert 'mu' in variational.metadata.stan_vars_dims
-    assert variational.metadata.stan_vars_dims['mu'] == (2,)
-    mu = variational.stan_variable(var='mu')
+    assert len(variational.metadata.stan_vars) == 1
+    assert 'mu' in variational.metadata.stan_vars
+    assert variational.metadata.stan_vars['mu'].dimensions == (2,)
+    mu = variational.stan_variable(var='mu', mean=True)
     assert mu.shape == (2,)
+    mu = variational.stan_variable(var='mu', mean=False)
+    assert mu.shape == (1000, 2)
     with pytest.raises(ValueError):
         variational.stan_variable(var='eta')
     with pytest.raises(ValueError):
@@ -113,23 +115,27 @@ def test_variables_3d() -> None:
         seed=1239812093,
         algorithm='meanfield',
     )
-    assert len(multidim_variational.metadata.stan_vars_dims) == 3
-    assert 'y_rep' in multidim_variational.metadata.stan_vars_dims
-    assert multidim_variational.metadata.stan_vars_dims['y_rep'] == (5, 4, 3)
-    var_y_rep = multidim_variational.stan_variable(var='y_rep')
-    assert var_y_rep.shape == (5, 4, 3)
-    var_beta = multidim_variational.stan_variable(var='beta')
-    assert var_beta.shape == (2,)  # 1-element tuple
-    var_frac_60 = multidim_variational.stan_variable(var='frac_60')
-    assert isinstance(var_frac_60, float)
-    vars = multidim_variational.stan_variables()
-    assert len(vars) == len(multidim_variational.metadata.stan_vars_dims)
+    assert len(multidim_variational.metadata.stan_vars) == 3
+    assert 'y_rep' in multidim_variational.metadata.stan_vars
+    assert multidim_variational.metadata.stan_vars['y_rep'].dimensions == (
+        5,
+        4,
+        3,
+    )
+    var_y_rep = multidim_variational.stan_variable(var='y_rep', mean=False)
+    assert var_y_rep.shape == (1000, 5, 4, 3)
+    var_beta = multidim_variational.stan_variable(var='beta', mean=False)
+    assert var_beta.shape == (1000, 2)
+    var_frac_60 = multidim_variational.stan_variable(var='frac_60', mean=False)
+    assert var_frac_60.shape == (1000,)
+    vars = multidim_variational.stan_variables(mean=False)
+    assert len(vars) == len(multidim_variational.metadata.stan_vars)
     assert 'y_rep' in vars
-    assert vars['y_rep'].shape == (5, 4, 3)
+    assert vars['y_rep'].shape == (1000, 5, 4, 3)
     assert 'beta' in vars
-    assert vars['beta'].shape == (2,)
+    assert vars['beta'].shape == (1000, 2)
     assert 'frac_60' in vars
-    assert isinstance(vars['frac_60'], float)
+    assert vars['frac_60'].shape == (1000,)
 
 
 def test_variational_good() -> None:
@@ -216,12 +222,13 @@ def test_single_row_csv() -> None:
     model = CmdStanModel(stan_file=stan)
     # testing data parsing, allow non-convergence
     vb_fit = model.variational(require_converged=False, seed=12345)
-    assert isinstance(vb_fit.stan_variable('theta'), float)
-    z_as_ndarray = vb_fit.stan_variable(var="z")
-    assert z_as_ndarray.shape == (4, 3)
+
+    assert vb_fit.stan_variable('theta', mean=False).shape == (1000,)
+    z_as_ndarray = vb_fit.stan_variable(var="z", mean=False)
+    assert z_as_ndarray.shape == (1000, 4, 3)
     for i in range(4):
         for j in range(3):
-            assert int(z_as_ndarray[i, j]) == i + 1
+            assert int(z_as_ndarray[0, i, j]) == i + 1
 
 
 def test_show_console() -> None:
@@ -269,15 +276,21 @@ def test_complex_output() -> None:
         algorithm='meanfield',
     )
 
-    assert fit.stan_variable('zs').shape == (2, 3)
-    assert fit.stan_variable('z') == 3 + 4j
+    assert fit.stan_variable('zs', mean=False).shape == (1000, 2, 3)
+    # TODO(2.0): change
+    np.testing.assert_equal(fit.z, 3 + 4j)
+    # np.testing.assert_equal(fit.z, np.repeat(3 + 4j, 1000))
 
     np.testing.assert_allclose(
-        fit.stan_variable('zs'), np.array([[3, 4j, 5], [1j, 2j, 3j]])
+        fit.stan_variable('zs', mean=False)[0],
+        np.array([[3, 4j, 5], [1j, 2j, 3j]]),
     )
 
     # make sure the name 'imag' isn't magic
-    assert fit.stan_variable('imag').shape == (2,)
+    assert fit.stan_variable('imag', mean=False).shape == (
+        1000,
+        2,
+    )
 
 
 def test_attrs() -> None:
@@ -291,14 +304,19 @@ def test_attrs() -> None:
         algorithm='meanfield',
     )
 
-    assert fit.a == 4.5
+    # TODO(2.0): swap tests
+    np.testing.assert_equal(fit.a, 4.5)
     assert fit.b.shape == (3,)
     assert isinstance(fit.theta, float)
 
-    assert fit.stan_variable('thin') == 3.5
+    # np.testing.assert_equal(fit.a, np.repeat(4.5, 1000))
+    # assert fit.b.shape == (1000, 3)
+    # assert fit.theta.shape == (1000,)
+
+    assert fit.stan_variable('thin', mean=True) == 3.5
 
     assert isinstance(fit.variational_params_np, np.ndarray)
-    assert fit.stan_variable('variational_params_np') == 0
+    assert fit.stan_variable('variational_params_np', mean=True) == 0
 
     with pytest.raises(AttributeError, match='Unknown variable name:'):
         dummy = fit.c

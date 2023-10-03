@@ -49,7 +49,8 @@ BERNOULLI_COLS = SAMPLER_STATE + ['theta']
     [
         'bernoulli.stan',
         'bernoulli with space in name.stan',
-        'path with space/' + 'bernoulli_path_with_space.stan',
+        'path with space/bernoulli_path_with_space.stan',
+        'path~with~tilde/bernoulli_path_with_tilde.stan',
     ],
 )
 def test_bernoulli_good(stanfile: str):
@@ -276,21 +277,24 @@ def test_init_types() -> None:
         iter_sampling=100,
         inits=[inits_path1, inits_path2],
         show_progress=False,
-    )
-    assert 'init={}'.format(inits_path1.replace('\\', '\\\\')) in repr(
-        bern_fit.runset
+        force_one_process_per_chain=False,
     )
 
-    with pytest.raises(ValueError):
-        bern_model.sample(
-            data=jdata,
-            chains=2,
-            parallel_chains=2,
-            seed=12345,
-            iter_warmup=100,
-            iter_sampling=100,
-            inits=(1, 2),
-        )
+    # will be copied, given basename
+    assert isinstance(bern_fit.runset._args.inits, str)
+
+    bern_fit = bern_model.sample(
+        data=jdata,
+        chains=2,
+        seed=12345,
+        iter_warmup=100,
+        iter_sampling=100,
+        inits=[inits_path1, inits_path2],
+        show_progress=False,
+        force_one_process_per_chain=True,
+    )
+    # one per process
+    assert isinstance(bern_fit.runset._args.inits, list)
 
     with pytest.raises(ValueError):
         bern_model.sample(
@@ -302,6 +306,34 @@ def test_init_types() -> None:
             iter_sampling=100,
             inits=-1,
         )
+
+    # test that inits are actually used by having a bad one
+    init_1 = {"theta": 0.2}
+    init_2 = {"theta": 4.0}
+    with pytest.raises(RuntimeError):
+        bern_fit = bern_model.sample(
+            data=jdata,
+            chains=2,
+            seed=12345,
+            inits=[init_1, init_2],
+            iter_warmup=100,
+            iter_sampling=100,
+            force_one_process_per_chain=True,
+            show_progress=False,
+        )
+    if not cmdstan_version_before(2, 33):
+        # https://github.com/stan-dev/cmdstan/pull/1191
+        with pytest.raises(RuntimeError):
+            bern_fit = bern_model.sample(
+                data=jdata,
+                chains=2,
+                seed=12345,
+                inits=[init_1, init_2],
+                iter_warmup=100,
+                iter_sampling=100,
+                force_one_process_per_chain=False,
+                show_progress=False,
+            )
 
 
 def test_bernoulli_bad() -> None:
@@ -744,18 +776,24 @@ def test_validate_good_run() -> None:
     draws_pd = fit.draws_pd()
     assert draws_pd.shape == (
         fit.runset.chains * fit.num_draws_sampling,
-        len(fit.column_names),
+        len(fit.column_names) + 3,
     )
-    assert fit.draws_pd(vars=['theta']).shape == (400, 1)
-    assert fit.draws_pd(vars=['lp__', 'theta']).shape == (400, 2)
-    assert fit.draws_pd(vars=['theta', 'lp__']).shape == (400, 2)
-    assert fit.draws_pd(vars='theta').shape == (400, 1)
+    assert fit.draws_pd(vars=['theta']).shape == (400, 4)
+    assert fit.draws_pd(vars=['lp__', 'theta']).shape == (400, 5)
+    assert fit.draws_pd(vars=['theta', 'lp__']).shape == (400, 5)
+    assert fit.draws_pd(vars='theta').shape == (400, 4)
 
     assert list(fit.draws_pd(vars=['theta', 'lp__']).columns) == [
+        'chain__',
+        'iter__',
+        'draw__',
         'theta',
         'lp__',
     ]
     assert list(fit.draws_pd(vars=['lp__', 'theta']).columns) == [
+        'chain__',
+        'iter__',
+        'draw__',
         'lp__',
         'theta',
     ]
@@ -809,14 +847,14 @@ def test_validate_big_run() -> None:
     ]
     fit = CmdStanMCMC(runset)
     phis = ['phi[{}]'.format(str(x + 1)) for x in range(2095)]
-    column_names = list(fit.metadata.method_vars_cols.keys()) + phis
+    column_names = list(fit.metadata.method_vars.keys()) + phis
     assert fit.num_draws_sampling == 1000
     assert fit.column_names == tuple(column_names)
     assert fit.metric_type == 'diag_e'
     assert fit.step_size.shape == (2,)
     assert fit.metric.shape == (2, 2095)
     assert fit.draws().shape == (1000, 2, 2102)
-    assert fit.draws_pd(vars=['phi']).shape == (2000, 2095)
+    assert fit.draws_pd(vars=['phi']).shape == (2000, 2098)
     with raises_nested(ValueError, r'Unknown variable: gamma'):
         fit.draws_pd(vars=['gamma'])
 
@@ -827,14 +865,14 @@ def test_instantiate_from_csvfiles() -> None:
     draws_pd = bern_fit.draws_pd()
     assert draws_pd.shape == (
         bern_fit.runset.chains * bern_fit.num_draws_sampling,
-        len(bern_fit.column_names),
+        len(bern_fit.column_names) + 3,
     )
     csvfiles_path = os.path.join(DATAFILES_PATH, 'runset-big')
     big_fit = from_csv(path=csvfiles_path)
     draws_pd = big_fit.draws_pd()
     assert draws_pd.shape == (
         big_fit.runset.chains * big_fit.num_draws_sampling,
-        len(big_fit.column_names),
+        len(big_fit.column_names) + 3,
     )
     # list
     csvfiles_path = os.path.join(DATAFILES_PATH, 'runset-good')
@@ -847,14 +885,14 @@ def test_instantiate_from_csvfiles() -> None:
     draws_pd = bern_fit.draws_pd()
     assert draws_pd.shape == (
         bern_fit.runset.chains * bern_fit.num_draws_sampling,
-        len(bern_fit.column_names),
+        len(bern_fit.column_names) + 3,
     )
     # single csvfile
     bern_fit = from_csv(path=csvfiles[0])
     draws_pd = bern_fit.draws_pd()
     assert draws_pd.shape == (
         bern_fit.num_draws_sampling,
-        len(bern_fit.column_names),
+        len(bern_fit.column_names) + 3,
     )
     # glob
     csvfiles_path = os.path.join(csvfiles_path, '*.csv')
@@ -862,7 +900,26 @@ def test_instantiate_from_csvfiles() -> None:
     draws_pd = big_fit.draws_pd()
     assert draws_pd.shape == (
         big_fit.runset.chains * big_fit.num_draws_sampling,
-        len(big_fit.column_names),
+        len(big_fit.column_names) + 3,
+    )
+
+
+def test_pd_xr_agreement():
+    csvfiles_path = os.path.join(DATAFILES_PATH, 'runset-good', '*.csv')
+    bern_fit = from_csv(path=csvfiles_path)
+
+    draws_pd = bern_fit.draws_pd()
+    draws_xr = bern_fit.draws_xr()
+
+    # check that the indexing is the same between the two
+    np.testing.assert_equal(
+        draws_pd[draws_pd['chain__'] == 2]['theta'],
+        draws_xr.theta.sel(chain=2).values,
+    )
+    # "draw" is 0-indexed in xarray, equiv. "iter__" is 1-indexed in pandas
+    np.testing.assert_equal(
+        draws_pd[draws_pd['iter__'] == 100]['theta'],
+        draws_xr.theta.sel(draw=99).values,
     )
 
 
@@ -929,7 +986,7 @@ def test_instantiate_from_csvfiles_fail(
 def test_from_csv_fixed_param() -> None:
     csv_path = os.path.join(DATAFILES_PATH, 'fixed_param_sample.csv')
     fixed_param_sample = from_csv(path=csv_path)
-    assert fixed_param_sample.draws_pd().shape == (100, 85)
+    assert fixed_param_sample.draws_pd().shape == (100, 88)
 
 
 def test_custom_metric() -> None:
@@ -1291,14 +1348,14 @@ def test_save_warmup() -> None:
         len(BERNOULLI_COLS),
     )
 
-    assert bern_fit.draws_pd().shape == (200, len(BERNOULLI_COLS))
+    assert bern_fit.draws_pd().shape == (200, len(BERNOULLI_COLS) + 3)
     assert bern_fit.draws_pd(inc_warmup=False).shape == (
         200,
-        len(BERNOULLI_COLS),
+        len(BERNOULLI_COLS) + 3,
     )
     assert bern_fit.draws_pd(inc_warmup=True).shape == (
         600,
-        len(BERNOULLI_COLS),
+        len(BERNOULLI_COLS) + 3,
     )
 
 
@@ -1370,7 +1427,7 @@ def test_dont_save_warmup(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING):
         assert bern_fit.draws_pd(inc_warmup=True).shape == (
             200,
-            len(BERNOULLI_COLS),
+            len(BERNOULLI_COLS) + 3,
         )
     check_present(
         caplog,
@@ -1409,9 +1466,9 @@ def test_variable_bern() -> None:
     bern_fit = bern_model.sample(
         data=jdata, chains=2, seed=12345, iter_warmup=100, iter_sampling=100
     )
-    assert 1 == len(bern_fit.metadata.stan_vars_dims)
-    assert 'theta' in bern_fit.metadata.stan_vars_dims
-    assert bern_fit.metadata.stan_vars_dims['theta'] == ()
+    assert 1 == len(bern_fit.metadata.stan_vars)
+    assert 'theta' in bern_fit.metadata.stan_vars
+    assert bern_fit.metadata.stan_vars['theta'].dimensions == ()
     assert bern_fit.stan_variable(var='theta').shape == (200,)
     with pytest.raises(ValueError):
         bern_fit.stan_variable(var='eta')
@@ -1423,11 +1480,11 @@ def test_variables_2d() -> None:
     csvfiles_path = os.path.join(DATAFILES_PATH, 'lotka-volterra.csv')
     fit = from_csv(path=csvfiles_path)
     assert 20 == fit.num_draws_sampling
-    assert 8 == len(fit.metadata.stan_vars_dims)
-    assert 'z' in fit.metadata.stan_vars_dims
-    assert fit.metadata.stan_vars_dims['z'] == (20, 2)
+    assert 8 == len(fit.metadata.stan_vars)
+    assert 'z' in fit.metadata.stan_vars
+    assert fit.metadata.stan_vars['z'].dimensions == (20, 2)
     vars = fit.stan_variables()
-    assert len(vars) == len(fit.metadata.stan_vars_dims)
+    assert len(vars) == len(fit.metadata.stan_vars)
     assert 'z' in vars
     assert vars['z'].shape == (20, 20, 2)
     assert 'theta' in vars
@@ -1439,9 +1496,9 @@ def test_variables_3d() -> None:
     csvfiles_path = os.path.join(DATAFILES_PATH, 'multidim_vars.csv')
     fit = from_csv(path=csvfiles_path)
     assert 20 == fit.num_draws_sampling
-    assert 3 == len(fit.metadata.stan_vars_dims)
-    assert 'y_rep' in fit.metadata.stan_vars_dims
-    assert fit.metadata.stan_vars_dims['y_rep'] == (5, 4, 3)
+    assert 3 == len(fit.metadata.stan_vars)
+    assert 'y_rep' in fit.metadata.stan_vars
+    assert fit.metadata.stan_vars['y_rep'].dimensions == (5, 4, 3)
     var_y_rep = fit.stan_variable(var='y_rep')
     assert var_y_rep.shape == (20, 5, 4, 3)
     var_beta = fit.stan_variable(var='beta')
@@ -1449,7 +1506,7 @@ def test_variables_3d() -> None:
     var_frac_60 = fit.stan_variable(var='frac_60')
     assert var_frac_60.shape == (20,)
     vars = fit.stan_variables()
-    assert len(vars) == len(fit.metadata.stan_vars_dims)
+    assert len(vars) == len(fit.metadata.stan_vars)
     assert 'y_rep' in vars
     assert vars['y_rep'].shape == (20, 5, 4, 3)
     assert 'beta' in vars
@@ -1499,8 +1556,7 @@ def test_validate() -> None:
     assert bern_fit.num_draws_warmup == 100
     assert bern_fit.num_draws_sampling == 50
     assert len(bern_fit.column_names) == 8
-    assert len(bern_fit.metadata.stan_vars_dims) == 1
-    assert len(bern_fit.metadata.stan_vars_cols.keys()) == 1
+    assert len(bern_fit.metadata.stan_vars) == 1
     assert bern_fit.metric_type == 'diag_e'
 
 
@@ -1646,14 +1702,13 @@ def test_metadata() -> None:
     assert fit.metadata.cmdstan_config['metric'] == 'diag_e'
     np.testing.assert_almost_equal(fit.metadata.cmdstan_config['delta'], 0.80)
 
-    assert 'n_leapfrog__' in fit.metadata.method_vars_cols
-    assert 'energy__' in fit.metadata.method_vars_cols
-    assert 'beta' not in fit.metadata.method_vars_cols
-    assert 'energy__' not in fit.metadata.stan_vars_dims
-    assert 'beta' in fit.metadata.stan_vars_dims
-    assert 'beta' in fit.metadata.stan_vars_cols
-    assert fit.metadata.stan_vars_dims['beta'] == (2,)
-    assert fit.metadata.stan_vars_cols['beta'] == (7, 8)
+    assert 'n_leapfrog__' in fit.metadata.method_vars
+    assert 'energy__' in fit.metadata.method_vars
+    assert 'beta' not in fit.metadata.method_vars
+    assert 'energy__' not in fit.metadata.stan_vars
+    assert 'beta' in fit.metadata.stan_vars
+    assert fit.metadata.stan_vars['beta'].dimensions == (2,)
+    assert tuple(fit.metadata.stan_vars['beta'].columns()) == (7, 8)
 
 
 def test_save_latent_dynamics() -> None:
@@ -1935,6 +1990,24 @@ def test_json_edges() -> None:
     fit = data_model.sample(data, chains=1, iter_warmup=1, iter_sampling=1)
     assert np.isnan(fit.stan_variable("nan_out")[0])
     assert np.isinf(fit.stan_variable("inf_out")[0])
+
+
+def test_json_junk_alongside_data() -> None:
+    stan = os.path.join(DATAFILES_PATH, 'data-test.stan')
+    data_model = CmdStanModel(stan_file=stan)
+    data = {
+        "inf": float("inf"),
+        "nan": float("NaN"),
+        "_foo": "this should be harmless!",
+    }
+    data_model.sample(data, chains=1, iter_warmup=1, iter_sampling=1)
+
+
+def test_tuple_data_in() -> None:
+    stan = os.path.join(DATAFILES_PATH, 'tuple_data.stan')
+    data_model = CmdStanModel(stan_file=stan)
+    data = {"x": (1, 2, 3), 'y': [(i, np.random.randn(4, 5)) for i in range(3)]}
+    data_model.sample(data, chains=1, iter_warmup=1, iter_sampling=1)
 
 
 @pytest.mark.order(before="test_no_xarray")

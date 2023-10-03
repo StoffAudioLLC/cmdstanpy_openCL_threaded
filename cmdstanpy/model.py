@@ -1,6 +1,5 @@
 """CmdStanModel"""
 
-import logging
 import os
 import platform
 import re
@@ -9,34 +8,61 @@ import subprocess
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import cpu_count
-from numbers import Real
-from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    TypeVar,
+    Union,
+)
 
+import pandas as pd
+from tqdm.auto import tqdm
+
+from cmdstanpy import (
+    _CMDSTAN_REFRESH,
+    _CMDSTAN_SAMPLING,
+    _CMDSTAN_WARMUP,
+    _TMPDIR,
+    compilation,
+)
 from cmdstanpy.cmdstan_args import (
     CmdStanArgs,
     GenerateQuantitiesArgs,
+    LaplaceArgs,
+    Method,
     OptimizeArgs,
+    PathfinderArgs,
     SamplerArgs,
     VariationalArgs,
 )
-from cmdstanpy.compiler_opts import CompilerOptions
 from cmdstanpy.stanfit import (
     CmdStanGQ,
+    CmdStanLaplace,
     CmdStanMCMC,
     CmdStanMLE,
+    CmdStanPathfinder,
     CmdStanVB,
     RunSet,
 )
 from cmdstanpy.utils import (
     EXTENSION,
-    MaybeDictToFilePath,
-    TemporaryCopiedFile,
     cmdstan_path,
     do_command,
     get_logger,
     scan_sampler_csv,
 )
+from cmdstanpy.utils.filesystem import temp_inits, temp_single_json
+
+from . import progress as progbar
+
+OptionalPath = Union[str, os.PathLike, None]
+Fit = TypeVar('Fit', CmdStanMCMC, CmdStanMLE, CmdStanVB)
 
 
 class CmdStanModel:
@@ -73,13 +99,15 @@ class CmdStanModel:
 
     def __init__(
         self,
-        model_name: str = None,
-        stan_file: str = None,
-        exe_file: str = None,
-        compile: bool = True,
-        stanc_options: Dict = None,
-        cpp_options: Dict = None,
-        logger: logging.Logger = None,
+        model_name: Optional[str] = None,
+        stan_file: OptionalPath = None,
+        exe_file: OptionalPath = None,
+        force_compile: bool = False,
+        stanc_options: Optional[Dict[str, Any]] = None,
+        cpp_options: Optional[Dict[str, Any]] = None,
+        user_header: OptionalPath = None,
+        *,
+        compile: Union[bool, Literal['force'], None] = None,
     ) -> None:
         """
         Initialize object given constructor args.
@@ -95,12 +123,34 @@ class CmdStanModel:
         self._name = None
         self._stan_file = None
         self._exe_file = None
-        self._compiler_options = CompilerOptions(
-            stanc_options=stanc_options, cpp_options=cpp_options
+        self._compiler_options = compilation.CompilerOptions(
+            stanc_options=stanc_options,
+            cpp_options=cpp_options,
+            user_header=user_header,
         )
-        self._logger = logger or get_logger()
+        self._compiler_options.validate()
+
+        self._fixed_param = False
+
+        if compile is None:
+            compile = True
+        else:
+            get_logger().warning(
+                "CmdStanModel(compile=...) is deprecated and will be "
+                "removed in the next major version. The constructor will "
+                "always ensure a model has a compiled executable.\n"
+                "If you wish to force recompilation, use force_compile=True "
+                "instead."
+            )
+
+        if force_compile:
+            compile = 'force'
 
         if model_name is not None:
+            get_logger().warning(
+                "CmdStanModel(model_name=...) is deprecated and will be "
+                "removed in the next major version."
+            )
             if not model_name.strip():
                 raise ValueError(
                     'Invalid value for argument model name, found "{}"'.format(
@@ -131,16 +181,7 @@ class CmdStanModel:
                 program = fd.read()
             if '#include' in program:
                 path, _ = os.path.split(self._stan_file)
-                if self._compiler_options is None:
-                    self._compiler_options = CompilerOptions(
-                        stanc_options={'include_paths': [path]}
-                    )
-                elif self._compiler_options._stanc_options is None:
-                    self._compiler_options._stanc_options = {
-                        'include_paths': [path]
-                    }
-                else:
-                    self._compiler_options.add_include_path(path)
+                self._compiler_options.add_include_path(path)
 
         if exe_file is not None:
             self._exe_file = os.path.realpath(os.path.expanduser(exe_file))
@@ -176,13 +217,7 @@ class CmdStanModel:
             )
 
         if compile and self._exe_file is None:
-            self.compile()
-            if self._exe_file is None:
-                raise ValueError(
-                    'Unable to compile Stan model file: {}.'.format(
-                        self._stan_file
-                    )
-                )
+            self.compile(force=str(compile).lower() == 'force', _internal=True)
 
     def __repr__(self) -> str:
         repr = 'CmdStanModel: name={}'.format(self._name)
@@ -210,6 +245,133 @@ class CmdStanModel:
         """Full path to Stan exe file."""
         return self._exe_file
 
+    def exe_info(self) -> Dict[str, str]:
+        """
+        Run model with option 'info'. Parse output statements, which all
+        have form 'key = value' into a Dict.
+        If exe file compiled with CmdStan < 2.27, option 'info' isn't
+        available and the method returns an empty dictionary.
+        """
+        result: Dict[str, str] = {}
+        if self.exe_file is None:
+            return result
+        try:
+            info = StringIO()
+            do_command(cmd=[str(self.exe_file), 'info'], fd_out=info)
+            lines = info.getvalue().split('\n')
+            for line in lines:
+                kv_pair = [x.strip() for x in line.split('=')]
+                if len(kv_pair) != 2:
+                    continue
+                result[kv_pair[0]] = kv_pair[1]
+            return result
+        except RuntimeError as e:
+            get_logger().debug(e)
+            return result
+
+    def src_info(self) -> Dict[str, Any]:
+        """
+        Run stanc with option '--info'.
+
+        If stanc is older than 2.27 or if the stan
+        file cannot be found, returns an empty dictionary.
+        """
+        if self.stan_file is None or cmdstan_version_before(2, 27):
+            return {}
+        return compilation.src_info(str(self.stan_file), self._compiler_options)
+
+    def format(
+        self,
+        overwrite_file: bool = False,
+        canonicalize: Union[bool, str, Iterable[str]] = False,
+        max_line_length: int = 78,
+        *,
+        backup: bool = True,
+    ) -> None:
+        """
+        Run stanc's auto-formatter on the model code. Either saves directly
+        back to the file or prints for inspection
+
+
+        :param overwrite_file: If True, save the updated code to disk, rather
+            than printing it. By default False
+        :param canonicalize: Whether or not the compiler should 'canonicalize'
+            the Stan model, removing things like deprecated syntax. Default is
+            False. If True, all canonicalizations are run. If it is a list of
+            strings, those options are passed to stanc (new in Stan 2.29)
+        :param max_line_length: Set the wrapping point for the formatter. The
+            default value is 78, which wraps most lines by the 80th character.
+        :param backup: If True, create a stanfile.bak backup before
+            writing to the file. Only disable this if you're sure you have other
+            copies of the file or are using a version control system like Git.
+        """
+        if self.stan_file is None or not os.path.isfile(self.stan_file):
+            raise ValueError("No Stan file found for this module")
+        try:
+            cmd = (
+                [os.path.join(cmdstan_path(), 'bin', 'stanc' + EXTENSION)]
+                # handle include-paths, allow-undefined etc
+                + self._compiler_options.compose_stanc(None)
+                + [str(self.stan_file)]
+            )
+
+            if canonicalize:
+                if cmdstan_version_before(2, 29):
+                    if isinstance(canonicalize, bool):
+                        cmd.append('--print-canonical')
+                    else:
+                        raise ValueError(
+                            "Invalid arguments passed for current CmdStan"
+                            + " version({})\n".format(
+                                cmdstan_version() or "Unknown"
+                            )
+                            + "--canonicalize requires 2.29 or higher"
+                        )
+                else:
+                    if isinstance(canonicalize, str):
+                        cmd.append('--canonicalize=' + canonicalize)
+                    elif isinstance(canonicalize, Iterable):
+                        cmd.append('--canonicalize=' + ','.join(canonicalize))
+                    else:
+                        cmd.append('--print-canonical')
+
+            # before 2.29, having both --print-canonical
+            # and --auto-format printed twice
+            if not (cmdstan_version_before(2, 29) and canonicalize):
+                cmd.append('--auto-format')
+
+            if not cmdstan_version_before(2, 29):
+                cmd.append(f'--max-line-length={max_line_length}')
+            elif max_line_length != 78:
+                raise ValueError(
+                    "Invalid arguments passed for current CmdStan version"
+                    + " ({})\n".format(cmdstan_version() or "Unknown")
+                    + "--max-line-length requires 2.29 or higher"
+                )
+
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, check=True
+            )
+            if out.stderr:
+                get_logger().warning(out.stderr)
+            result = out.stdout
+            if overwrite_file:
+                if result:
+                    if backup:
+                        shutil.copyfile(
+                            self.stan_file,
+                            str(self.stan_file)
+                            + '.bak-'
+                            + datetime.now().strftime("%Y%m%d%H%M%S"),
+                        )
+                    with open(self.stan_file, 'w') as file_handle:
+                        file_handle.write(result)
+            else:
+                print(result)
+
+        except (ValueError, RuntimeError) as e:
+            raise RuntimeError("Stanc formatting failed") from e
+
     @property
     def stanc_options(self) -> Dict:
         """Options to stanc compilers."""
@@ -235,12 +397,15 @@ class CmdStanModel:
             )
         return code
 
+    # TODO(2.0): remove
     def compile(
         self,
         force: bool = False,
         stanc_options: Dict = None,
         cpp_options: Dict = None,
         override_options: bool = False,
+        *,
+        _internal: bool = False,
     ) -> None:
         """
         Compile the given Stan program file.  Translates the Stan code to
@@ -261,90 +426,71 @@ class CmdStanModel:
         :param override_options: When ``True``, override existing option.
             When ``False``, add/replace existing options.  Default is ``False``.
         """
+        if not _internal:
+            get_logger().warning(
+                "CmdStanModel.compile() is deprecated and will be removed in "
+                "the next major version. To compile a model, use the "
+                "CmdStanModel() constructor or cmdstanpy.compile_stan_file()."
+            )
+
         if not self._stan_file:
             raise RuntimeError('Please specify source file')
 
         compiler_options = None
-        if not (stanc_options is None and cpp_options is None):
-            compiler_options = CompilerOptions(
-                stanc_options=stanc_options, cpp_options=cpp_options
+        if (
+            stanc_options is not None
+            or cpp_options is not None
+            or user_header is not None
+        ):
+            compiler_options = compilation.CompilerOptions(
+                stanc_options=stanc_options,
+                cpp_options=cpp_options,
+                user_header=user_header,
             )
             compiler_options.validate()
-            if self._compiler_options is None:
-                self._compiler_options = compiler_options
-            elif override_options:
-                self._compiler_options = compiler_options
-            else:
-                self._compiler_options.add(compiler_options)
 
-        compilation_failed = False
-        with TemporaryCopiedFile(self._stan_file) as (stan_file, is_copied):
-            exe_file, _ = os.path.splitext(os.path.abspath(stan_file))
-            exe_file = Path(exe_file).as_posix() + EXTENSION
-            do_compile = True
-            if os.path.exists(exe_file):
-                src_time = os.path.getmtime(self._stan_file)
-                exe_time = os.path.getmtime(exe_file)
-                if exe_time > src_time and not force:
-                    do_compile = False
-                    self._logger.info('found newer exe file, not recompiling')
-
-            if do_compile:
-                self._logger.info(
-                    'compiling stan program, exe file: %s', exe_file
-                )
-                if self._compiler_options is not None:
-                    self._compiler_options.validate()
-                    self._logger.info(
-                        'compiler options: %s', self._compiler_options
-                    )
-                make = os.getenv(
-                    'MAKE',
-                    'make'
-                    if platform.system() != 'Windows'
-                    else 'mingw32-make',
-                )
-                cmd = [make]
-                if self._compiler_options is not None:
-                    cmd.extend(self._compiler_options.compose())
-                cmd.append(Path(exe_file).as_posix())
-                try:
-                    do_command(cmd, cmdstan_path(), logger=self._logger)
-                except RuntimeError as e:
-                    self._logger.error(
-                        'file %s, exception %s', stan_file, str(e)
-                    )
-                    compilation_failed = True
-
-            if not compilation_failed:
-                if is_copied:
-                    original_target_dir = os.path.dirname(
-                        os.path.abspath(self._stan_file)
-                    )
-                    new_exec_name = (
-                        os.path.basename(os.path.splitext(self._stan_file)[0])
-                        + EXTENSION
-                    )
-                    self._exe_file = os.path.join(
-                        original_target_dir, new_exec_name
-                    )
-                    shutil.copy(exe_file, self._exe_file)
+            if compiler_options != self._compiler_options:
+                force = True
+                if self._compiler_options is None:
+                    self._compiler_options = compiler_options
+                elif override_options:
+                    self._compiler_options = compiler_options
                 else:
-                    self._exe_file = exe_file
-                self._logger.info('compiled model file: %s', self._exe_file)
-            else:
-                self._logger.error('model compilation failed')
+                    self._compiler_options.add(compiler_options)
+
+        self._exe_file = compilation.compile_stan_file(
+            str(self.stan_file),
+            force=force,
+            stanc_options=self._compiler_options.stanc_options,
+            cpp_options=self._compiler_options.cpp_options,
+            user_header=self._compiler_options.user_header,
+        )
 
     def optimize(
         self,
-        data: Union[Dict, str] = None,
-        seed: int = None,
-        inits: Union[Dict, float, str] = None,
-        output_dir: str = None,
-        sig_figs: int = None,
-        algorithm: str = None,
-        init_alpha: float = None,
-        iter: int = None,
+        data: Union[Mapping[str, Any], str, os.PathLike, None] = None,
+        seed: Optional[int] = None,
+        inits: Union[Mapping[str, Any], float, str, os.PathLike, None] = None,
+        output_dir: OptionalPath = None,
+        sig_figs: Optional[int] = None,
+        save_profile: bool = False,
+        algorithm: Optional[str] = None,
+        init_alpha: Optional[float] = None,
+        tol_obj: Optional[float] = None,
+        tol_rel_obj: Optional[float] = None,
+        tol_grad: Optional[float] = None,
+        tol_rel_grad: Optional[float] = None,
+        tol_param: Optional[float] = None,
+        history_size: Optional[int] = None,
+        iter: Optional[int] = None,
+        save_iterations: bool = False,
+        require_converged: bool = True,
+        show_console: bool = False,
+        refresh: Optional[int] = None,
+        time_fmt: str = "%Y%m%d%H%M%S",
+        timeout: Optional[float] = None,
+        jacobian: bool = False,
+        # would be nice to move this further up, but that's a breaking change
     ) -> CmdStanMLE:
         """
         Run the specified CmdStan optimize algorithm to produce a
@@ -406,12 +552,54 @@ class CmdStanModel:
 
         :param iter: Total number of iterations
 
+        :param save_iterations: When ``True``, save intermediate approximations
+            to the output CSV file.  Default is ``False``.
+
+        :param require_converged: Whether or not to raise an error if Stan
+            reports that "The algorithm may not have converged".
+
+        :param show_console: If ``True``, stream CmdStan messages sent to
+            stdout and stderr to the console.  Default is ``False``.
+
+        :param refresh: Specify the number of iterations cmdstan will take
+            between progress messages. Default value is 100.
+
+        :param time_fmt: A format string passed to
+            :meth:`~datetime.datetime.strftime` to decide the file names for
+            output CSVs. Defaults to "%Y%m%d%H%M%S"
+
+        :param timeout: Duration at which optimization times out in seconds.
+
+        :param jacobian: Whether or not to use the Jacobian adjustment for
+            constrained variables in optimization. By default this is false,
+            meaning optimization yields the Maximum Likehood Estimate (MLE).
+            Setting it to true yields the Maximum A Posteriori Estimate (MAP).
+
         :return: CmdStanMLE object
         """
         optimize_args = OptimizeArgs(
-            algorithm=algorithm, init_alpha=init_alpha, iter=iter
+            algorithm=algorithm,
+            init_alpha=init_alpha,
+            tol_obj=tol_obj,
+            tol_rel_obj=tol_rel_obj,
+            tol_grad=tol_grad,
+            tol_rel_grad=tol_rel_grad,
+            tol_param=tol_param,
+            history_size=history_size,
+            iter=iter,
+            save_iterations=save_iterations,
+            jacobian=jacobian,
         )
-        with MaybeDictToFilePath(data, inits) as (_data, _inits):
+
+        if jacobian and cmdstan_version_before(2, 32, self.exe_info()):
+            raise ValueError(
+                "Jacobian adjustment for optimization is only supported "
+                "in CmdStan 2.32 and above."
+            )
+
+        with temp_single_json(data) as _data, temp_inits(
+            inits, allow_multiple=False
+        ) as _inits:
             args = CmdStanArgs(
                 self._name,
                 self._exe_file,
@@ -439,15 +627,22 @@ class CmdStanModel:
     # pylint: disable=too-many-arguments
     def sample(
         self,
-        data: Union[Dict, str] = None,
-        chains: Union[int, None] = None,
-        parallel_chains: Union[int, None] = None,
-        threads_per_chain: Union[int, None] = None,
-        seed: Union[int, List[int]] = None,
-        chain_ids: Union[int, List[int]] = None,
-        inits: Union[Dict, float, str, List[str]] = None,
-        iter_warmup: int = None,
-        iter_sampling: int = None,
+        data: Union[Mapping[str, Any], str, os.PathLike, None] = None,
+        chains: Optional[int] = None,
+        parallel_chains: Optional[int] = None,
+        threads_per_chain: Optional[int] = None,
+        seed: Union[int, List[int], None] = None,
+        chain_ids: Union[int, List[int], None] = None,
+        inits: Union[
+            Mapping[str, Any],
+            float,
+            str,
+            List[str],
+            List[Mapping[str, Any]],
+            None,
+        ] = None,
+        iter_warmup: Optional[int] = None,
+        iter_sampling: Optional[int] = None,
         save_warmup: bool = False,
         thin: int = None,
         max_treedepth: float = None,
@@ -475,7 +670,7 @@ class CmdStanModel:
         Unspecified arguments are not included in the call to CmdStan, i.e.,
         those arguments will have CmdStan default values.
 
-        For each chain, the ``CmdStanMCMC`` object records the command,
+        For each chain, the :class:`CmdStanMCMC` object records the command,
         the return code, the sampler output file paths, and the corresponding
         console outputs, if any. The output files are written either to a
         specified output directory or to a temporary directory which is deleted
@@ -529,6 +724,7 @@ class CmdStanModel:
             * dictionary - pairs parameter name : initial value.
             * string - pathname to a JSON or Rdump data file.
             * list of strings - per-chain pathname to data file.
+            * list of dictionaries - per-chain initial values.
 
         :param iter_warmup: Number of warmup iterations for each chain.
 
@@ -593,8 +789,7 @@ class CmdStanModel:
             only those values in the generated quantities block that are
             produced by RNG functions may change.  This provides
             a way to use Stan programs to generate simulated data via the
-            generated quantities block.  This option must be used when the
-            parameters block is empty.  Default value is ``False``.
+            generated quantities block.  Default value is ``False``.
 
         :param output_dir: Name of the directory to which CmdStan output
             files are written. If unspecified, output files will be written
@@ -605,35 +800,121 @@ class CmdStanModel:
             precision for the system file I/O is used; the usual value is 6.
             Introduced in CmdStan-2.25.
 
-        :param save_diagnostics: Whether or not to save diagnostics. If True,
-            csv output files are written to an output file with filename
-            template '<model_name>-<YYYYMMDDHHMM>-diagnostic-<chain_id>',
-            e.g. 'bernoulli-201912081451-diagnostic-1.csv'.
+        :param save_latent_dynamics: Whether or not to output the position and
+            momentum information for the model parameters (unconstrained).
+            If ``True``, CSV outputs are written to an output file
+            '<model_name>-<YYYYMMDDHHMM>-diagnostic-<chain_id>',
+            e.g. 'bernoulli-201912081451-diagnostic-1.csv', see
+            https://mc-stan.org/docs/cmdstan-guide/stan_csv.html,
+            section "Diagnostic CSV output file" for details.
 
-        :param show_progress: Use tqdm progress bar to show sampling progress.
-            If show_progress=='notebook' use tqdm_notebook
-            (needs nodejs for jupyter).
+        :param save_profile: Whether or not to profile auto-diff operations in
+            labelled blocks of code.  If ``True``, CSV outputs are written to
+            file '<model_name>-<YYYYMMDDHHMM>-profile-<chain_id>'.
+            Introduced in CmdStan-2.26, see
+            https://mc-stan.org/docs/cmdstan-guide/stan_csv.html,
+            section "Profiling CSV output file" for details.
 
-        :param validate_csv: If ``False``, skip scan of sample csv output file.
-            When sample is large or disk i/o is slow, will speed up processing.
-            Default is ``True`` - sample csv files are scanned for completeness
-            and consistency.
+        :param show_progress: If ``True``, display progress bar to track
+            progress for warmup and sampling iterations.  Default is ``True``,
+            unless package tqdm progress bar encounter errors.
+
+        :param show_console: If ``True``, stream CmdStan messages sent to stdout
+            and stderr to the console.  Default is ``False``.
+
+        :param refresh: Specify the number of iterations CmdStan will take
+            between progress messages. Default value is 100.
+
+        :param time_fmt: A format string passed to
+            :meth:`~datetime.datetime.strftime` to decide the file names for
+            output CSVs. Defaults to "%Y%m%d%H%M%S"
+
+        :param force_one_process_per_chain: If ``True``, run multiple chains in
+            distinct processes regardless of model ability to run parallel
+            chains (CmdStan 2.28+ feature). If ``False``, always run multiple
+            chains in one process (does not check that this is valid).
+
+            If None (Default): Check that CmdStan version is >=2.28, and that
+            model was compiled with STAN_THREADS=True, and utilize the
+            parallel chain functionality if those conditions are met.
+
+        :param timeout: Duration at which sampling times out in seconds.
 
         :return: CmdStanMCMC object
         """
         if chains is None:
-            if fixed_param:
-                chains = 1
-            else:
-                chains = 4
+            chains = 4
         if chains < 1:
             raise ValueError(
                 'Chains must be a positive integer value, found {}.'.format(
                     chains
                 )
             )
+
+        if parallel_chains is None:
+            parallel_chains = max(min(cpu_count(), chains), 1)
+        elif parallel_chains > chains:
+            get_logger().info(
+                'Requested %u parallel_chains but only %u required, '
+                'will run all chains in parallel.',
+                parallel_chains,
+                chains,
+            )
+            parallel_chains = chains
+        elif parallel_chains < 1:
+            raise ValueError(
+                'Argument parallel_chains must be a positive integer, '
+                'found {}.'.format(parallel_chains)
+            )
+        if threads_per_chain is None:
+            threads_per_chain = 1
+        if threads_per_chain < 1:
+            raise ValueError(
+                'Argument threads_per_chain must be a positive integer, '
+                'found {}.'.format(threads_per_chain)
+            )
+
+        parallel_procs = parallel_chains
+        num_threads = threads_per_chain
+        one_process_per_chain = True
+        info_dict = self.exe_info()
+        stan_threads = info_dict.get('STAN_THREADS', 'false').lower()
+        # run multi-chain sampler unless algo is fixed_param or 1 chain
+        if chains == 1:
+            force_one_process_per_chain = True
+
+        if (
+            force_one_process_per_chain is None
+            and not cmdstan_version_before(2, 28, info_dict)
+            and stan_threads == 'true'
+        ):
+            one_process_per_chain = False
+            num_threads = parallel_chains * num_threads
+            parallel_procs = 1
+        if force_one_process_per_chain is False:
+            if not cmdstan_version_before(2, 28, info_dict):
+                one_process_per_chain = False
+                num_threads = parallel_chains * num_threads
+                parallel_procs = 1
+                if stan_threads == 'false':
+                    get_logger().warning(
+                        'Stan program not compiled for threading, '
+                        'process will run chains sequentially. '
+                        'For multi-chain parallelization, recompile '
+                        'the model with argument '
+                        '"cpp_options={\'STAN_THREADS\':\'TRUE\'}.'
+                    )
+            else:
+                get_logger().warning(
+                    'Installed version of CmdStan cannot multi-process '
+                    'chains, will run %d processes. '
+                    'Run "install_cmdstan" to upgrade to latest version.',
+                    chains,
+                )
+        os.environ['STAN_NUM_THREADS'] = str(num_threads)
+
         if chain_ids is None:
-            chain_ids = [x + 1 for x in range(chains)]
+            chain_ids = [i + 1 for i in range(chains)]
         else:
             if isinstance(chain_ids, int):
                 if chain_ids < 1:
@@ -641,8 +922,15 @@ class CmdStanModel:
                         'Chain_id must be a positive integer value,'
                         ' found {}.'.format(chain_ids)
                     )
-                chain_ids = [chain_ids + i for i in range(chains)]
+                chain_ids = [i + chain_ids for i in range(chains)]
             else:
+                if not one_process_per_chain:
+                    for i, j in zip(chain_ids, chain_ids[1:]):
+                        if i != j - 1:
+                            raise ValueError(
+                                'chain_ids must be sequential list of integers,'
+                                ' found {}.'.format(chain_ids)
+                            )
                 if not len(chain_ids) == chains:
                     raise ValueError(
                         'Chain_ids must correspond to number of chains'
@@ -656,52 +944,9 @@ class CmdStanModel:
                             'Chain_id must be a non-negative integer value,'
                             ' found {}.'.format(chain_id)
                         )
-        if parallel_chains is None:
-            parallel_chains = max(min(cpu_count(), chains), 1)
-        elif parallel_chains > chains:
-            self._logger.info(
-                'Requesting %u parallel_chains for %u chains,'
-                ' running all chains in parallel.',
-                parallel_chains,
-                chains,
-            )
-            parallel_chains = chains
-        elif parallel_chains < 1:
-            raise ValueError(
-                'Argument parallel_chains must be a positive integer value, '
-                'found {}.'.format(parallel_chains)
-            )
-        if threads_per_chain is None:
-            threads_per_chain = 1
-        if threads_per_chain < 1:
-            raise ValueError(
-                'Argument threads_per_chain must be a positive integer value, '
-                'found {}.'.format(threads_per_chain)
-            )
-        self._logger.debug(
-            'total threads: %u', parallel_chains * threads_per_chain
-        )
-        os.environ['STAN_NUM_THREADS'] = str(threads_per_chain)
-
-        refresh = None
-        if show_progress:
-            try:
-                import tqdm
-
-                self._logger.propagate = False
-            except ImportError:
-                self._logger.warning(
-                    (
-                        'Package tqdm not installed, cannot show progress '
-                        'information. Please install tqdm with '
-                        "'pip install tqdm'"
-                    )
-                )
-                show_progress = False
-
-        # TODO:  issue 49: inits can be initialization function
 
         sampler_args = SamplerArgs(
+            num_chains=1 if one_process_per_chain else chains,
             iter_warmup=iter_warmup,
             iter_sampling=iter_sampling,
             save_warmup=save_warmup,
@@ -716,77 +961,124 @@ class CmdStanModel:
             adapt_step_size=adapt_step_size,
             fixed_param=fixed_param,
         )
-        with MaybeDictToFilePath(data, inits) as (_data, _inits):
+
+        with temp_single_json(data) as _data, temp_inits(
+            inits, id=chain_ids[0]
+        ) as _inits:
+            cmdstan_inits: Union[str, List[str], int, float, None]
+            if one_process_per_chain and isinstance(inits, list):  # legacy
+                cmdstan_inits = [
+                    f"{_inits[:-5]}_{i}.json" for i in chain_ids  # type: ignore
+                ]
+            else:
+                cmdstan_inits = _inits
+
             args = CmdStanArgs(
                 self._name,
                 self._exe_file,
                 chain_ids=chain_ids,
                 data=_data,
                 seed=seed,
-                inits=_inits,
+                inits=cmdstan_inits,
                 output_dir=output_dir,
                 sig_figs=sig_figs,
-                save_diagnostics=save_diagnostics,
+                save_latent_dynamics=save_latent_dynamics,
+                save_profile=save_profile,
                 method_args=sampler_args,
                 refresh=refresh,
-                logger=self._logger,
             )
-            runset = RunSet(args=args, chains=chains, chain_ids=chain_ids)
-            pbar = None
-            all_pbars = []
 
-            with ThreadPoolExecutor(max_workers=parallel_chains) as executor:
-                for i in range(chains):
-                    if show_progress:
-                        if (
-                            isinstance(show_progress, str)
-                            and show_progress.lower() == 'notebook'
-                        ):
-                            try:
-                                tqdm_pbar = tqdm.tqdm_notebook
-                            except ImportError:
-                                msg = (
-                                    'Cannot import tqdm.tqdm_notebook.\n'
-                                    'Functionality is only supported on the '
-                                    'Jupyter Notebook and compatible platforms'
-                                    '.\nPlease follow the instructions in '
-                                    'https://github.com/tqdm/tqdm/issues/394#'
-                                    'issuecomment-384743637 and remember to '
-                                    'stop & start your jupyter server.'
-                                )
-                                self._logger.warning(msg)
-                                tqdm_pbar = tqdm.tqdm
-                        else:
-                            tqdm_pbar = tqdm.tqdm
-                        # enable dynamic_ncols for advanced users
-                        # currently hidden feature
-                        dynamic_ncols = os.environ.get(
-                            'TQDM_DYNAMIC_NCOLS', 'False'
-                        )
-                        if dynamic_ncols.lower() in ['0', 'false']:
-                            dynamic_ncols = False
-                        else:
-                            dynamic_ncols = True
+            if show_console:
+                show_progress = False
+            else:
+                show_progress = show_progress and progbar.allow_show_progress()
+                get_logger().info('CmdStan start processing')
 
-                        pbar = tqdm_pbar(
-                            desc='Chain {} - warmup'.format(i + 1),
-                            position=i,
-                            total=1,  # Will set total from Stan's output
-                            dynamic_ncols=dynamic_ncols,
-                        )
-                        all_pbars.append(pbar)
-                    executor.submit(self._run_cmdstan, runset, i, pbar)
-
-            # Closing all progress bars
-            for pbar in all_pbars:
-                pbar.close()
+            progress_hook: Optional[Callable[[str, int], None]] = None
             if show_progress:
-                # re-enable logger for console
-                self._logger.propagate = True
+                iter_total = 0
+                if iter_warmup is None:
+                    iter_total += _CMDSTAN_WARMUP
+                else:
+                    iter_total += iter_warmup
+                if iter_sampling is None:
+                    iter_total += _CMDSTAN_SAMPLING
+                else:
+                    iter_total += iter_sampling
+                if refresh is None:
+                    refresh = _CMDSTAN_REFRESH
+                iter_total = iter_total // refresh + 2
 
+                progress_hook = self._wrap_sampler_progress_hook(
+                    chain_ids=chain_ids,
+                    total=iter_total,
+                )
+            runset = RunSet(
+                args=args,
+                chains=chains,
+                chain_ids=chain_ids,
+                time_fmt=time_fmt,
+                one_process_per_chain=one_process_per_chain,
+            )
+            with ThreadPoolExecutor(max_workers=parallel_procs) as executor:
+                for i in range(runset.num_procs):
+                    executor.submit(
+                        self._run_cmdstan,
+                        runset=runset,
+                        idx=i,
+                        show_progress=show_progress,
+                        show_console=show_console,
+                        progress_hook=progress_hook,
+                        timeout=timeout,
+                    )
+            if show_progress and progress_hook is not None:
+                progress_hook("Done", -1)  # -1 == all chains finished
+
+                # advance terminal window cursor past progress bars
+                term_size: os.terminal_size = shutil.get_terminal_size(
+                    fallback=(80, 24)
+                )
+                if term_size is not None and term_size[0] > 0:
+                    for i in range(chains):
+                        sys.stdout.write(' ' * term_size[0])
+                        sys.stdout.flush()
+                sys.stdout.write('\n')
+                get_logger().info('CmdStan done processing.')
+
+            runset.raise_for_timeouts()
+
+            get_logger().debug('runset\n%s', repr(runset))
+
+            # hack needed to parse CSV files if model has no params
+            # needed if exe is supplied without stan file
+            with open(runset.stdout_files[0], 'r') as fd:
+                console_msgs = fd.read()
+                get_logger().debug('Chain 1 console:\n%s', console_msgs)
+                if 'running fixed_param sampler' in console_msgs:
+                    get_logger().debug("Detected fixed param model")
+                    sampler_args.fixed_param = True
+                    runset._args.method_args = sampler_args
+
+            errors = runset.get_err_msgs()
             if not runset._check_retcodes():
-                msg = 'Error during sampling.\n{}'.format(runset.get_err_msgs())
+                msg = (
+                    f'Error during sampling:\n{errors}\n'
+                    f'Command and output files:\n{repr(runset)}'
+                )
+                if not show_console:
+                    msg += (
+                        '\nConsider re-running with show_console=True if the'
+                        ' above output is unclear!'
+                    )
                 raise RuntimeError(msg)
+            if errors:
+                msg = f'Non-fatal error during sampling:\n{errors}'
+                if not show_console:
+                    msg += (
+                        '\nConsider re-running with show_console=True if the'
+                        ' above output is unclear!'
+                    )
+                get_logger().warning(msg)
 
             mcmc = CmdStanMCMC(runset, validate_csv, logger=self._logger)
         return mcmc
@@ -848,71 +1140,78 @@ class CmdStanModel:
 
         :return: CmdStanGQ object
         """
-        sample_csv_files = []
-        sample_drawset = None
-        chains = 0
+        # TODO(2.0): remove
+        if mcmc_sample is not None:
+            if previous_fit:
+                raise ValueError(
+                    "Cannot supply both 'previous_fit' and "
+                    "deprecated argument 'mcmc_sample'"
+                )
+            get_logger().warning(
+                "Argument name `mcmc_sample` is deprecated, please "
+                "rename to `previous_fit`."
+            )
 
-        if isinstance(mcmc_sample, CmdStanMCMC):
-            sample_csv_files = mcmc_sample.runset.csv_files
-            sample_drawset = mcmc_sample.draws_pd()
-            chains = mcmc_sample.chains
-            chain_ids = mcmc_sample.chain_ids
-        elif isinstance(mcmc_sample, list):
-            if len(mcmc_sample) < 1:
-                raise ValueError('MCMC sample cannot be empty list')
-            sample_csv_files = mcmc_sample
-            chains = len(sample_csv_files)
-            chain_ids = [x + 1 for x in range(chains)]
+            previous_fit = mcmc_sample  # type: ignore
+
+        if isinstance(previous_fit, (CmdStanMCMC, CmdStanMLE, CmdStanVB)):
+            fit_object = previous_fit
+            fit_csv_files = previous_fit.runset.csv_files
+        elif isinstance(previous_fit, list):
+            if len(previous_fit) < 1:
+                raise ValueError(
+                    'Expecting list of Stan CSV files, found empty list'
+                )
+            try:
+                fit_csv_files = previous_fit
+                fit_object = from_csv(fit_csv_files)  # type: ignore
+            except ValueError as e:
+                raise ValueError(
+                    'Invalid sample from Stan CSV files, error:\n\t{}\n\t'
+                    ' while processing files\n\t{}'.format(
+                        repr(e), '\n\t'.join(previous_fit)
+                    )
+                ) from e
         else:
             raise ValueError(
-                'MCMC sample must be either CmdStanMCMC object'
-                ' or list of paths to sample csv_files.'
+                'Previous fit must be either CmdStanPy fit object'
+                ' or list of paths to Stan CSV files.'
             )
-        try:
-            if sample_drawset is None:  # assemble sample from csv files
-                config = {}
-                # scan 1st csv file to get config
-                try:
-                    config = scan_sampler_csv(sample_csv_files[0])
-                except ValueError:
-                    config = scan_sampler_csv(sample_csv_files[0], True)
-                conf_iter_sampling = None
-                if 'num_samples' in config:
-                    conf_iter_sampling = int(config['num_samples'])
-                conf_iter_warmup = None
-                if 'num_warmup' in config:
-                    conf_iter_warmup = int(config['num_warmup'])
-                conf_thin = None
-                if 'thin' in config:
-                    conf_thin = int(config['thin'])
-                sampler_args = SamplerArgs(
-                    iter_sampling=conf_iter_sampling,
-                    iter_warmup=conf_iter_warmup,
-                    thin=conf_thin,
+        if isinstance(fit_object, CmdStanMCMC):
+            chains = fit_object.chains
+            chain_ids = fit_object.chain_ids
+            if fit_object._save_warmup:
+                get_logger().warning(
+                    'Sample contains saved warmup draws which will be used '
+                    'to generate additional quantities of interest.'
                 )
-                args = CmdStanArgs(
-                    self._name,
-                    self._exe_file,
-                    chain_ids=chain_ids,
-                    method_args=sampler_args,
+        elif isinstance(fit_object, CmdStanMLE):
+            if cmdstan_version_before(2, 31):
+                raise RuntimeError(
+                    "Method generate_quantities was not "
+                    "available for non-HMC until CmdStan 2.31"
                 )
-                runset = RunSet(args=args, chains=chains, chain_ids=chain_ids)
-                runset._csv_files = sample_csv_files
-                sample_fit = CmdStanMCMC(runset)
-                sample_drawset = sample_fit.draws_pd()
-        except ValueError as exc:
-            raise ValueError(
-                'Invalid mcmc_sample, error:\n\t{}\n\t'
-                ' while processing files\n\t{}'.format(
-                    repr(exc), '\n\t'.join(sample_csv_files)
+            chains = 1
+            chain_ids = [1]
+            if fit_object._save_iterations:
+                get_logger().warning(
+                    'MLE contains saved iterations which will be used '
+                    'to generate additional quantities of interest.'
                 )
-            ) from exc
+        else:  # isinstance(fit_object, CmdStanVB)
+            if cmdstan_version_before(2, 31):
+                raise RuntimeError(
+                    "Method generate_quantities was not "
+                    "available for non-HMC until CmdStan 2.31"
+                )
+            chains = 1
+            chain_ids = [1]
 
         generate_quantities_args = GenerateQuantitiesArgs(
             csv_files=sample_csv_files
         )
         generate_quantities_args.validate(chains)
-        with MaybeDictToFilePath(data, None) as (_data, _inits):
+        with temp_single_json(data) as _data:
             args = CmdStanArgs(
                 self._name,
                 self._exe_file,
@@ -929,12 +1228,26 @@ class CmdStanModel:
             parallel_chains = max(min(parallel_chains_avail - 2, chains), 1)
             with ThreadPoolExecutor(max_workers=parallel_chains) as executor:
                 for i in range(chains):
-                    executor.submit(self._run_cmdstan, runset, i)
+                    executor.submit(
+                        self._run_cmdstan,
+                        runset,
+                        i,
+                        show_console=show_console,
+                        timeout=timeout,
+                    )
 
-            if not runset._check_retcodes():
-                msg = 'Error during generate_quantities.\n{}'.format(
-                    runset.get_err_msgs()
+            runset.raise_for_timeouts()
+            errors = runset.get_err_msgs()
+            if errors:
+                msg = (
+                    f'Error during generate_quantities:\n{errors}\n'
+                    f'Command and output files:\n{repr(runset)}'
                 )
+                if not show_console:
+                    msg += (
+                        '\nConsider re-running with show_console=True if the'
+                        ' above output is unclear!'
+                    )
                 raise RuntimeError(msg)
             quantities = CmdStanGQ(runset=runset, mcmc_sample=sample_drawset)
         return quantities
@@ -953,11 +1266,17 @@ class CmdStanModel:
         elbo_samples: int = None,
         eta: Real = None,
         adapt_engaged: bool = True,
-        adapt_iter: int = None,
-        tol_rel_obj: Real = None,
-        eval_elbo: int = None,
-        output_samples: int = None,
+        adapt_iter: Optional[int] = None,
+        tol_rel_obj: Optional[float] = None,
+        eval_elbo: Optional[int] = None,
+        draws: Optional[int] = None,
         require_converged: bool = True,
+        show_console: bool = False,
+        refresh: Optional[int] = None,
+        time_fmt: str = "%Y%m%d%H%M%S",
+        timeout: Optional[float] = None,
+        *,
+        output_samples: Optional[int] = None,
     ) -> CmdStanVB:
         """
         Run CmdStan's variational inference algorithm to approximate
@@ -1028,7 +1347,7 @@ class CmdStanModel:
 
         :param eval_elbo: Number of iterations between ELBO evaluations.
 
-        :param output_samples: Number of approximate posterior output draws
+        :param draws: Number of approximate posterior output draws
             to save.
 
         :param require_converged: Whether or not to raise an error if stan
@@ -1036,6 +1355,20 @@ class CmdStanModel:
 
         :return: CmdStanVB object
         """
+        # TODO(2.0): remove
+        if output_samples is not None:
+            if draws is not None:
+                raise ValueError(
+                    "Cannot supply both 'draws' and deprecated argument "
+                    "'output_samples'"
+                )
+            get_logger().warning(
+                "Argument name `output_samples` is deprecated, please "
+                "rename to `draws`."
+            )
+
+            draws = output_samples
+
         variational_args = VariationalArgs(
             algorithm=algorithm,
             iter=iter,
@@ -1046,10 +1379,12 @@ class CmdStanModel:
             adapt_iter=adapt_iter,
             tol_rel_obj=tol_rel_obj,
             eval_elbo=eval_elbo,
-            output_samples=output_samples,
+            output_samples=draws,
         )
 
-        with MaybeDictToFilePath(data, inits) as (_data, _inits):
+        with temp_single_json(data) as _data, temp_inits(
+            inits, allow_multiple=False
+        ) as _inits:
             args = CmdStanArgs(
                 self._name,
                 self._exe_file,
@@ -1087,90 +1422,577 @@ class CmdStanModel:
         vb = CmdStanVB(runset)
         return vb
 
-    def _run_cmdstan(
-        self, runset: RunSet, idx: int = 0, pbar: Any = None
-    ) -> None:
+    def pathfinder(
+        self,
+        data: Union[Mapping[str, Any], str, os.PathLike, None] = None,
+        *,
+        init_alpha: Optional[float] = None,
+        tol_obj: Optional[float] = None,
+        tol_rel_obj: Optional[float] = None,
+        tol_grad: Optional[float] = None,
+        tol_rel_grad: Optional[float] = None,
+        tol_param: Optional[float] = None,
+        history_size: Optional[int] = None,
+        num_paths: Optional[int] = None,
+        max_lbfgs_iters: Optional[int] = None,
+        draws: Optional[int] = None,
+        num_single_draws: Optional[int] = None,
+        num_elbo_draws: Optional[int] = None,
+        # arguments standard to all methods
+        seed: Optional[int] = None,
+        inits: Union[Dict[str, float], float, str, os.PathLike, None] = None,
+        output_dir: OptionalPath = None,
+        sig_figs: Optional[int] = None,
+        save_profile: bool = False,
+        show_console: bool = False,
+        refresh: Optional[int] = None,
+        time_fmt: str = "%Y%m%d%H%M%S",
+        timeout: Optional[float] = None,
+    ) -> CmdStanPathfinder:
         """
-        Encapsulates call to CmdStan.
-        Spawn process, capture console output to file, record returncode.
+        Run CmdStan's Pathfinder variational inference algorithm.
+
+        :param data: Values for all data variables in the model, specified
+            either as a dictionary with entries matching the data variables,
+            or as the path of a data file in JSON or Rdump format.
+
+        :param num_paths: Number of single-path Pathfinders to run.
+            Default is 4, when the number of paths is 1 then no importance
+            sampling is done.
+
+        :param draws: Number of approximate draws to return.
+
+        :param num_single_draws: Number of draws each single-pathfinder will
+            draw.
+            If ``num_paths`` is 1, only one of this and ``draws`` should be
+            used.
+
+        :param max_lbfgs_iters: Maximum number of L-BFGS iterations.
+
+        :param num_elbo_draws: Number of Monte Carlo draws to evaluate ELBO.
+
+        :param seed: The seed for random number generator. Must be an integer
+            between 0 and 2^32 - 1. If unspecified,
+            :class:`numpy.random.RandomState` is used to generate a seed.
+
+        :param inits: Specifies how the algorithm initializes parameter values.
+            Initialization is either uniform random on a range centered on 0,
+            exactly 0, or a dictionary or file of initial values for some or all
+            parameters in the model.  The default initialization behavior will
+            initialize all parameter values on range [-2, 2] on the
+            *unconstrained* support.  If the expected parameter values are
+            too far from this range, this option may improve adaptation.
+            The following value types are allowed:
+
+            * Single number n > 0 - initialization range is [-n, n].
+            * 0 - all parameters are initialized to 0.
+            * dictionary - pairs parameter name : initial value.
+            * string - pathname to a JSON or Rdump data file.
+            * list of strings - per-path pathname to data file.
+            * list of dictionaries - per-path initial values.
+
+        :param init_alpha: For internal L-BFGS: Line search step size for
+            first iteration
+
+        :param tol_obj: For internal L-BFGS: Convergence tolerance on changes
+            in objective function value
+
+        :param tol_rel_obj: For internal L-BFGS: Convergence tolerance on
+            relative changes in objective function value
+
+        :param tol_grad: For internal L-BFGS: Convergence tolerance on the
+            norm of the gradient
+
+        :param tol_rel_grad: For internal L-BFGS: Convergence tolerance on
+            the relative norm of the gradient
+
+        :param tol_param: For internal L-BFGS: Convergence tolerance on changes
+            in parameter value
+
+        :param history_size: For internal L-BFGS: Size of the history for LBFGS
+            Hessian approximation. The value should be less than the
+            dimensionality of the parameter space. 5-10 is usually sufficient
+
+        :param output_dir: Name of the directory to which CmdStan output
+            files are written. If unspecified, output files will be written
+            to a temporary directory which is deleted upon session exit.
+
+        :param sig_figs: Numerical precision used for output CSV and text files.
+            Must be an integer between 1 and 18.  If unspecified, the default
+            precision for the system file I/O is used; the usual value is 6.
+            Introduced in CmdStan-2.25.
+
+        :param save_profile: Whether or not to profile auto-diff operations in
+            labelled blocks of code.  If ``True``, CSV outputs are written to
+            file '<model_name>-<YYYYMMDDHHMM>-profile-<path_id>'.
+            Introduced in CmdStan-2.26, see
+            https://mc-stan.org/docs/cmdstan-guide/stan_csv.html,
+            section "Profiling CSV output file" for details.
+
+        :param show_console: If ``True``, stream CmdStan messages sent to stdout
+            and stderr to the console.  Default is ``False``.
+
+        :param refresh: Specify the number of iterations CmdStan will take
+            between progress messages. Default value is 100.
+
+        :param time_fmt: A format string passed to
+            :meth:`~datetime.datetime.strftime` to decide the file names for
+            output CSVs. Defaults to "%Y%m%d%H%M%S"
+
+        :param timeout: Duration at which Pathfinder times
+            out in seconds. Defaults to None.
+
+        :return: A :class:`CmdStanPathfinder` object
+
+        References
+        ----------
+
+        Zhang, L., Carpenter, B., Gelman, A., & Vehtari, A. (2022). Pathfinder:
+        Parallel quasi-Newton variational inference. Journal of Machine Learning
+        Research, 23(306), 1–49. Retrieved from
+        http://jmlr.org/papers/v23/21-0889.html
         """
-        cmd = runset.cmds[idx]
-        self._logger.info('start chain %u', idx + 1)
-        self._logger.debug(
-            'threads: %s', str(os.environ.get('STAN_NUM_THREADS'))
-        )
-        self._logger.debug('sampling: %s', cmd)
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ
-        )
-        if pbar:
-            stdout_pbar = self._read_progress(proc, pbar, idx)
-        stdout, stderr = proc.communicate()
-        if pbar:
-            stdout = stdout_pbar + stdout
-        self._logger.info('finish chain %u', idx + 1)
-        if stdout:
-            with open(runset.stdout_files[idx], 'w+') as fd:
-                fd.write(stdout.decode('utf-8'))
-        if stderr:
-            with open(runset.stderr_files[idx], 'w+') as fd:
-                fd.write(stderr.decode('utf-8'))
-        runset._set_retcode(idx, proc.returncode)
-
-    def _read_progress(
-        self, proc: subprocess.Popen, pbar: Any, idx: int
-    ) -> bytes:
-        """
-        Update tqdm progress bars according to CmdStan console progress msgs.
-        Poll process to get CmdStan console outputs,
-        check for output lines that start with 'Iteration: '.
-        NOTE: if CmdStan output messages change, this will break.
-        """
-        pattern = (
-            r'^Iteration\:\s*(\d+)\s*/\s*(\d+)\s*\[\s*\d+%\s*\]\s*\((\S*)\)$'
-        )
-        pattern_compiled = re.compile(pattern, flags=re.IGNORECASE)
-        previous_count = 0
-        stdout = b''
-        changed_description = False  # Changed from 'warmup' to 'sample'
-        pbar.set_description(desc=f'Chain {idx + 1} - warmup', refresh=True)
-
-        try:
-            # iterate while process is sampling
-            while proc.poll() is None:
-                output = proc.stdout.readline()
-                stdout += output
-                output = output.decode('utf-8').strip()
-                if output.startswith('Iteration'):
-                    match = re.search(pattern_compiled, output)
-                    if match:
-                        current_count = int(match.group(1))
-                        total_count = int(match.group(2))
-
-                        if pbar.total != total_count:
-                            pbar.reset(total=total_count)
-
-                        if (
-                            match.group(3).lower() == 'sampling'
-                            and not changed_description
-                        ):
-                            pbar.set_description(f'Chain {idx + 1} - sample')
-                            changed_description = True
-
-                        pbar.update(current_count - previous_count)
-                        previous_count = current_count
-
-            pbar.set_description(f'Chain {idx + 1} -   done', refresh=True)
-
-            if 'notebook' in type(pbar).__name__:
-                # In Jupyter make the bar green by closing it
-                pbar.close()
-
-        except Exception as e:  # pylint: disable=broad-except
-            self._logger.warning(
-                'Chain %s: Failed to read the progress on the fly. Error: %s',
-                idx,
-                repr(e),
+        if cmdstan_version_before(2, 33, self.exe_info()):
+            raise ValueError(
+                "Method 'pathfinder' not available for CmdStan versions "
+                "before 2.33"
             )
 
-        return stdout
+        if num_paths == 1:
+            if num_single_draws is None:
+                num_single_draws = draws
+            if draws is not None and num_single_draws != draws:
+                raise ValueError(
+                    "Cannot specify both 'draws' and 'num_single_draws'"
+                    " when 'num_paths' is 1"
+                )
+
+        pathfinder_args = PathfinderArgs(
+            init_alpha=init_alpha,
+            tol_obj=tol_obj,
+            tol_rel_obj=tol_rel_obj,
+            tol_grad=tol_grad,
+            tol_rel_grad=tol_rel_grad,
+            tol_param=tol_param,
+            history_size=history_size,
+            num_psis_draws=draws,
+            num_paths=num_paths,
+            max_lbfgs_iters=max_lbfgs_iters,
+            num_draws=num_single_draws,
+            num_elbo_draws=num_elbo_draws,
+        )
+
+        with temp_single_json(data) as _data, temp_inits(inits) as _inits:
+            args = CmdStanArgs(
+                self._name,
+                self._exe_file,
+                chain_ids=None,
+                data=_data,
+                seed=seed,
+                inits=_inits,
+                output_dir=output_dir,
+                sig_figs=sig_figs,
+                save_profile=save_profile,
+                method_args=pathfinder_args,
+                refresh=refresh,
+            )
+            dummy_chain_id = 0
+            runset = RunSet(args=args, chains=1, time_fmt=time_fmt)
+            self._run_cmdstan(
+                runset,
+                dummy_chain_id,
+                show_console=show_console,
+                timeout=timeout,
+            )
+        runset.raise_for_timeouts()
+
+        if not runset._check_retcodes():
+            msg = "Error during Pathfinder! Command '{}' failed: {}".format(
+                ' '.join(runset.cmd(0)), runset.get_err_msgs()
+            )
+            raise RuntimeError(msg)
+        return CmdStanPathfinder(runset)
+
+    def log_prob(
+        self,
+        params: Union[Dict[str, Any], str, os.PathLike],
+        data: Union[Mapping[str, Any], str, os.PathLike, None] = None,
+        *,
+        jacobian: bool = True,
+        sig_figs: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Calculate the log probability and gradient at the given parameter
+        values.
+
+        .. note:: This function is **NOT** an efficient way to evaluate the log
+            density of the model. It should be used for diagnostics ONLY.
+            Please, do not use this for other purposes such as testing new
+            sampling algorithms!
+
+        :param params: Values for all parameters in the model, specified
+            either as a dictionary with entries matching the parameter
+            variables, or as the path of a data file in JSON or Rdump format.
+
+            These should be given on the constrained (natural) scale.
+
+        :param data: Values for all data variables in the model, specified
+            either as a dictionary with entries matching the data variables,
+            or as the path of a data file in JSON or Rdump format.
+
+        :param jacobian: Whether or not to enable the Jacobian adjustment
+            for constrained parameters. Defaults to ``True``.
+
+        :param sig_figs: Numerical precision used for output CSV and text files.
+            Must be an integer between 1 and 18.  If unspecified, the default
+            precision for the system file I/O is used; the usual value is 6.
+
+        :return: A pandas.DataFrame containing columns "lp__" and additional
+            columns for the gradient values. These gradients will be for the
+            unconstrained parameters of the model.
+        """
+
+        if cmdstan_version_before(2, 31, self.exe_info()):
+            raise ValueError(
+                "Method 'log_prob' not available for CmdStan versions "
+                "before 2.31"
+            )
+        with temp_single_json(data) as _data, temp_single_json(
+            params
+        ) as _params:
+            cmd = [
+                str(self.exe_file),
+                "log_prob",
+                f"constrained_params={_params}",
+                f"jacobian={int(jacobian)}",
+            ]
+            if _data is not None:
+                cmd += ["data", f"file={_data}"]
+
+            output_dir = tempfile.mkdtemp(prefix=self.name, dir=_TMPDIR)
+
+            output = os.path.join(output_dir, "output.csv")
+            cmd += ["output", f"file={output}"]
+            if sig_figs is not None:
+                cmd.append(f"sig_figs={sig_figs}")
+
+            get_logger().debug("Cmd: %s", str(cmd))
+
+            proc = subprocess.run(
+                cmd, capture_output=True, check=False, text=True
+            )
+            if proc.returncode:
+                get_logger().error(
+                    "'log_prob' command failed!\nstdout:%s\nstderr:%s",
+                    proc.stdout,
+                    proc.stderr,
+                )
+                raise RuntimeError(
+                    "Method 'log_prob' failed with return code "
+                    + str(proc.returncode)
+                )
+
+            result = pd.read_csv(output, comment="#")
+            return result
+
+    def laplace_sample(
+        self,
+        data: Union[Mapping[str, Any], str, os.PathLike, None] = None,
+        mode: Union[CmdStanMLE, str, os.PathLike, None] = None,
+        draws: Optional[int] = None,
+        *,
+        jacobian: bool = True,  # NB: Different than optimize!
+        seed: Optional[int] = None,
+        output_dir: OptionalPath = None,
+        sig_figs: Optional[int] = None,
+        save_profile: bool = False,
+        show_console: bool = False,
+        refresh: Optional[int] = None,
+        time_fmt: str = "%Y%m%d%H%M%S",
+        timeout: Optional[float] = None,
+        opt_args: Optional[Dict[str, Any]] = None,
+    ) -> CmdStanLaplace:
+        """
+        Run a Laplace approximation around the posterior mode.
+
+        :param data: Values for all data variables in the model, specified
+            either as a dictionary with entries matching the data variables,
+            or as the path of a data file in JSON or Rdump format.
+
+        :param mode: The mode around which to place the approximation, either
+
+            * A :class:`CmdStanMLE` object
+            * A path to a CSV file containing the output of an optimization run.
+            * ``None`` - use default optimizer settings and/or any ``opt_args``.
+
+        :param draws: Number of approximate draws to return.
+            Defaults to 1000
+
+        :param jacobian: Whether or not to enable the Jacobian adjustment
+            for constrained parameters. Defaults to ``True``.
+            Note: This must match the argument used in the creation of
+            ``mode``, if supplied.
+
+        :param output_dir: Name of the directory to which CmdStan output
+            files are written. If unspecified, output files will be written
+            to a temporary directory which is deleted upon session exit.
+
+        :param sig_figs: Numerical precision used for output CSV and text files.
+            Must be an integer between 1 and 18.  If unspecified, the default
+            precision for the system file I/O is used; the usual value is 6.
+            Introduced in CmdStan-2.25.
+
+        :param save_profile: Whether or not to profile auto-diff operations in
+            labelled blocks of code.  If ``True``, CSV outputs are written to
+            file '<model_name>-<YYYYMMDDHHMM>-profile-<path_id>'.
+            Introduced in CmdStan-2.26, see
+            https://mc-stan.org/docs/cmdstan-guide/stan_csv.html,
+            section "Profiling CSV output file" for details.
+
+        :param show_console: If ``True``, stream CmdStan messages sent to stdout
+            and stderr to the console.  Default is ``False``.
+
+        :param refresh: Specify the number of iterations CmdStan will take
+            between progress messages. Default value is 100.
+
+        :param time_fmt: A format string passed to
+            :meth:`~datetime.datetime.strftime` to decide the file names for
+            output CSVs. Defaults to "%Y%m%d%H%M%S"
+
+        :param timeout: Duration at which Pathfinder times
+            out in seconds. Defaults to None.
+
+        :param opt_args: Dictionary of additional arguments
+            which will be passed to :meth:`~CmdStanModel.optimize`
+
+        :return: A :class:`CmdStanLaplace` object.
+        """
+        if cmdstan_version_before(2, 32, self.exe_info()):
+            raise ValueError(
+                "Method 'laplace_sample' not available for CmdStan versions "
+                "before 2.32"
+            )
+        if opt_args is not None and mode is not None:
+            raise ValueError(
+                "Cannot specify both 'opt_args' and 'mode' arguments"
+            )
+        if mode is None:
+            optimize_args = {
+                "seed": seed,
+                "sig_figs": sig_figs,
+                "jacobian": jacobian,
+                "save_profile": save_profile,
+                "show_console": show_console,
+                "refresh": refresh,
+                "time_fmt": time_fmt,
+                "timeout": timeout,
+                "output_dir": output_dir,
+            }
+            optimize_args.update(opt_args or {})
+            optimize_args['time_fmt'] = 'opt-' + time_fmt
+            try:
+                cmdstan_mode: CmdStanMLE = self.optimize(
+                    data=data,
+                    **optimize_args,  # type: ignore
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to run optimizer on model. "
+                    "Consider supplying a mode or additional optimizer args"
+                ) from e
+        elif not isinstance(mode, CmdStanMLE):
+            cmdstan_mode = from_csv(mode)  # type: ignore  # we check below
+        else:
+            cmdstan_mode = mode
+
+        if cmdstan_mode.runset.method != Method.OPTIMIZE:
+            raise ValueError(
+                "Mode must be a CmdStanMLE or a path to an optimize CSV"
+            )
+
+        mode_jacobian = (
+            cmdstan_mode.runset._args.method_args.jacobian  # type: ignore
+        )
+        if mode_jacobian != jacobian:
+            raise ValueError(
+                "Jacobian argument to optimize and laplace must match!\n"
+                f"Laplace was run with jacobian={jacobian},\n"
+                f"but optimize was run with jacobian={mode_jacobian}"
+            )
+
+        laplace_args = LaplaceArgs(
+            cmdstan_mode.runset.csv_files[0], draws, jacobian
+        )
+
+        with temp_single_json(data) as _data:
+            args = CmdStanArgs(
+                self._name,
+                self._exe_file,
+                chain_ids=None,
+                data=_data,
+                seed=seed,
+                output_dir=output_dir,
+                sig_figs=sig_figs,
+                save_profile=save_profile,
+                method_args=laplace_args,
+                refresh=refresh,
+            )
+            dummy_chain_id = 0
+            runset = RunSet(args=args, chains=1, time_fmt=time_fmt)
+            self._run_cmdstan(
+                runset,
+                dummy_chain_id,
+                show_console=show_console,
+                timeout=timeout,
+            )
+        runset.raise_for_timeouts()
+        return CmdStanLaplace(runset, cmdstan_mode)
+
+    def _run_cmdstan(
+        self,
+        runset: RunSet,
+        idx: int,
+        show_progress: bool = False,
+        show_console: bool = False,
+        progress_hook: Optional[Callable[[str, int], None]] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """
+        Helper function which encapsulates call to CmdStan.
+        Uses subprocess POpen object to run the process.
+        Records stdout, stderr messages, and process returncode.
+        Args 'show_progress' and 'show_console' allow use of progress bar,
+        streaming output to console, respectively.
+        """
+        get_logger().debug('idx %d', idx)
+        get_logger().debug(
+            'running CmdStan, num_threads: %s',
+            str(os.environ.get('STAN_NUM_THREADS')),
+        )
+
+        logger_prefix = 'CmdStan'
+        console_prefix = ''
+        if runset.one_process_per_chain:
+            logger_prefix = 'Chain [{}]'.format(runset.chain_ids[idx])
+            console_prefix = 'Chain [{}] '.format(runset.chain_ids[idx])
+
+        cmd = runset.cmd(idx)
+        get_logger().debug('CmdStan args: %s', cmd)
+
+        if not show_progress:
+            get_logger().info('%s start processing', logger_prefix)
+        try:
+            fd_out = open(runset.stdout_files[idx], 'w')
+            proc = subprocess.Popen(
+                cmd,
+                bufsize=1,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # avoid buffer overflow
+                env=os.environ,
+                universal_newlines=True,
+            )
+            timer: Optional[threading.Timer]
+            if timeout:
+
+                def _timer_target() -> None:
+                    # Abort if the process has already terminated.
+                    if proc.poll() is not None:
+                        return
+                    proc.terminate()
+                    runset._set_timeout_flag(idx, True)
+
+                timer = threading.Timer(timeout, _timer_target)
+                timer.daemon = True
+                timer.start()
+            else:
+                timer = None
+            while proc.poll() is None:
+                if proc.stdout is not None:
+                    line = proc.stdout.readline()
+                    fd_out.write(line)
+                    line = line.strip()
+                    if show_console:
+                        print(f'{console_prefix}{line}')
+                    elif progress_hook is not None:
+                        progress_hook(line, idx)
+
+            stdout, _ = proc.communicate()
+            retcode = proc.returncode
+            runset._set_retcode(idx, retcode)
+            if timer:
+                timer.cancel()
+
+            if stdout:
+                fd_out.write(stdout)
+                if show_console:
+                    lines = stdout.split('\n')
+                    for line in lines:
+                        print(f'{console_prefix}{line}')
+            fd_out.close()
+        except OSError as e:
+            msg = 'Failed with error {}\n'.format(str(e))
+            raise RuntimeError(msg) from e
+        finally:
+            fd_out.close()
+
+        if not show_progress:
+            get_logger().info('%s done processing', logger_prefix)
+
+        if retcode != 0:
+            retcode_summary = returncode_msg(retcode)
+            serror = ''
+            try:
+                serror = os.strerror(retcode)
+            except (ArithmeticError, ValueError):
+                pass
+            get_logger().error(
+                '%s error: %s %s', logger_prefix, retcode_summary, serror
+            )
+
+    @staticmethod
+    @progbar.wrap_callback
+    def _wrap_sampler_progress_hook(
+        chain_ids: List[int],
+        total: int,
+    ) -> Optional[Callable[[str, int], None]]:
+        """
+        Sets up tqdm callback for CmdStan sampler console msgs.
+        CmdStan progress messages start with "Iteration", for single chain
+        process, "Chain [id] Iteration" for multi-chain processing.
+        For the latter, manage array of pbars, update accordingly.
+        """
+        pat = re.compile(r'Chain \[(\d*)\] (Iteration.*)')
+        pbars: Dict[int, tqdm] = {
+            chain_id: tqdm(
+                total=total,
+                bar_format="{desc} |{bar}| {elapsed} {postfix[0][value]}",
+                postfix=[{"value": "Status"}],
+                desc=f'chain {chain_id}',
+                colour='yellow',
+            )
+            for chain_id in chain_ids
+        }
+
+        def progress_hook(line: str, idx: int) -> None:
+            if line == "Done":
+                for pbar in pbars.values():
+                    pbar.postfix[0]["value"] = 'Sampling completed'
+                    pbar.update(total - pbar.n)
+                    pbar.close()
+            else:
+                match = pat.match(line)
+                if match:
+                    idx = int(match.group(1))
+                    mline = match.group(2).strip()
+                elif line.startswith("Iteration"):
+                    mline = line
+                    idx = chain_ids[idx]
+                else:
+                    return
+                if 'Sampling' in mline:
+                    pbars[idx].colour = 'blue'
+                pbars[idx].update(1)
+                pbars[idx].postfix[0]["value"] = mline
+
+        return progress_hook
