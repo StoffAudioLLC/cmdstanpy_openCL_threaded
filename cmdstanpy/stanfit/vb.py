@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 
 from cmdstanpy.cmdstan_args import Method
-from cmdstanpy.utils import BaseType, scan_variational_csv
+from cmdstanpy.utils import scan_variational_csv
+from cmdstanpy.utils.logging import get_logger
 
 from .metadata import InferenceMetadata
 from .runset import RunSet
@@ -113,48 +114,84 @@ class CmdStanVB:
         """
         return self._metadata
 
-    def stan_variable(self, var: str) -> Union[np.ndarray, float]:
+    def stan_variable(
+        self, var: str, *, mean: Optional[bool] = None
+    ) -> Union[np.ndarray, float]:
         """
         Return a numpy.ndarray which contains the estimates for the
         for the named Stan program variable where the dimensions of the
-        numpy.ndarray match the shape of the Stan program variable.
+        numpy.ndarray match the shape of the Stan program variable, with
+        a leading axis added for the number of draws from the variational
+        approximation.
+
+        * If the variable is a scalar variable, the return array has shape
+          ( draws, ).
+        * If the variable is a vector, the return array has shape
+          ( draws, len(vector))
+        * If the variable is a matrix, the return array has shape
+          ( draws, size(dim 1), size(dim 2) )
+        * If the variable is an array with N dimensions, the return array
+          has shape ( draws, size(dim 1), ..., size(dim N))
 
         This functionaltiy is also available via a shortcut using ``.`` -
         writing ``fit.a`` is a synonym for ``fit.stan_variable("a")``
 
         :param var: variable name
 
+        :param mean: if True, return the variational mean. Otherwise,
+            return the variational sample.  The default behavior will
+            change in a future release to return the variational sample.
+
         See Also
         --------
         CmdStanVB.stan_variables
         CmdStanMCMC.stan_variable
         CmdStanMLE.stan_variable
+        CmdStanPathfinder.stan_variable
         CmdStanGQ.stan_variable
+        CmdStanLaplace.stan_variable
         """
-        if var is None:
-            raise ValueError('No variable name specified.')
-        if var not in self._metadata.stan_vars_dims:
+        # TODO(2.0): remove None case, make default `False`
+        if mean is None:
+            get_logger().warning(
+                "The default behavior of CmdStanVB.stan_variable() "
+                "will change in a future release to return the "
+                "variational sample, rather than the mean.\n"
+                "To maintain the current behavior, pass the argument "
+                "mean=True"
+            )
+            mean = True
+        if mean:
+            draws = self._variational_mean
+        else:
+            draws = self._variational_sample
+
+        try:
+            out: np.ndarray = self._metadata.stan_vars[var].extract_reshape(
+                draws
+            )
+            # TODO(2.0): remove
+            if out.shape == () or out.shape == (1,):
+                if mean:
+                    get_logger().warning(
+                        "The default behavior of "
+                        "CmdStanVB.stan_variable(mean=True) will change in a "
+                        "future release to always return a numpy.ndarray, even "
+                        "for scalar variables."
+                    )
+                return out.item()  # type: ignore
+            return out
+        except KeyError:
+            # pylint: disable=raise-missing-from
             raise ValueError(
                 f'Unknown variable name: {var}\n'
                 'Available variables are '
-                + ", ".join(self._metadata.stan_vars_dims)
+                + ", ".join(self._metadata.stan_vars.keys())
             )
-        col_idxs = list(self._metadata.stan_vars_cols[var])
-        shape: Tuple[int, ...] = ()
-        if len(col_idxs) > 1:
-            shape = self._metadata.stan_vars_dims[var]
-            result: np.ndarray = np.asarray(self._variational_mean)[col_idxs]
-            if self._metadata.stan_vars_types[var] == BaseType.COMPLEX:
-                result = result[..., ::2] + 1j * result[..., 1::2]
-                shape = shape[:-1]
 
-            result = result.reshape(shape, order="F")
-
-            return result
-        else:
-            return float(self._variational_mean[col_idxs[0]])
-
-    def stan_variables(self) -> Dict[str, Union[np.ndarray, float]]:
+    def stan_variables(
+        self, *, mean: Optional[bool] = None
+    ) -> Dict[str, Union[np.ndarray, float]]:
         """
         Return a dictionary mapping Stan program variables names
         to the corresponding numpy.ndarray containing the inferred values.
@@ -165,10 +202,12 @@ class CmdStanVB:
         CmdStanMCMC.stan_variables
         CmdStanMLE.stan_variables
         CmdStanGQ.stan_variables
+        CmdStanPathfinder.stan_variables
+        CmdStanLaplace.stan_variables
         """
         result = {}
-        for name in self._metadata.stan_vars_dims.keys():
-            result[name] = self.stan_variable(name)
+        for name in self._metadata.stan_vars:
+            result[name] = self.stan_variable(name, mean=mean)
         return result
 
     @property

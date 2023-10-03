@@ -88,7 +88,8 @@ class CompilerOptions:
         Check compiler args.
         Raise ValueError if invalid options are found.
         """
-        print("skipping validate")
+        pass
+        #print("skipping validate")
         #self.validate_stanc_opts()
         #self.validate_cpp_opts()
 

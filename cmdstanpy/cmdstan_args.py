@@ -366,6 +366,7 @@ class OptimizeArgs:
             cmd.append('iter={}'.format(self.iter))
         cmd.append('opencl')
         cmd.append('num_threads=16')
+        #cmd.append('num_chains=16')
         return cmd
 
 
