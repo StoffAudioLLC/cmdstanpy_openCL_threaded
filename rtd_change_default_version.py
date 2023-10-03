@@ -24,9 +24,7 @@ def set_version_active_on_rtd(
     default_version,
     server_addr="https://readthedocs.org",
 ):
-
     with requests.session() as s:
-
         url = server_addr + "/accounts/login/"
 
         # Fetch the login page

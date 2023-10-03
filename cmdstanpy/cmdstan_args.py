@@ -787,8 +787,8 @@ class CmdStanArgs:
             raise ValueError(
                 'Unsupported method args type: {}'.format(type(method_args))
             )
-        #self.method_args.validate(len(chain_ids) if chain_ids else None)
-        #self.validate()
+        # self.method_args.validate(len(chain_ids) if chain_ids else None)
+        # self.validate()
 
     def validate(self) -> None:
         """

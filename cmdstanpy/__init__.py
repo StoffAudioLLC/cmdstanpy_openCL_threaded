@@ -5,31 +5,17 @@ import atexit
 import shutil
 import tempfile
 
-_STANSUMMARY_STATS = [
-    'Mean',
-    'MCSE',
-    'StdDev',
-    '5%',
-    '50%',
-    '95%',
-    'N_Eff',
-    'N_Eff/s',
-    'R_hat',
-]
-
 _TMPDIR = tempfile.mkdtemp()
 _CMDSTAN_WARMUP = 1000
 _CMDSTAN_SAMPLING = 1000
 _CMDSTAN_THIN = 1
-_DOT_CMDSTANPY = '.cmdstanpy'
+_CMDSTAN_REFRESH = 100
 _DOT_CMDSTAN = '.cmdstan'
 
 
-def _cleanup_tmpdir():
+def _cleanup_tmpdir() -> None:
     """Force deletion of _TMPDIR."""
-    print('deleting tmpfiles dir: {}'.format(_TMPDIR))
-    #shutil.rmtree(_TMPDIR, ignore_errors=True)
-    print('done')
+    shutil.rmtree(_TMPDIR, ignore_errors=True)
 
 
 atexit.register(_cleanup_tmpdir)

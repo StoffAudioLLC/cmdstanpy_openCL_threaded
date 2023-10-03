@@ -402,7 +402,7 @@ napoleon_type_aliases = {
     "CmdStanVB": "~cmdstanpy.CmdStanVB",
     "CmdStanGQ": "~cmdstanpy.CmdStanGQ",
     "CmdStanLaplace": "~cmdstanpy.CmdStanLaplace",
-    "CmdStanPathfinder": "~cmdstanpy.CmdStanPathfinder"
+    "CmdStanPathfinder": "~cmdstanpy.CmdStanPathfinder",
 }
 
 nbsphinx_allow_errors = False
