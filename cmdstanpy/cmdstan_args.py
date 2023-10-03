@@ -1,21 +1,25 @@
 """
 CmdStan arguments
 """
-import logging
 import os
 from enum import Enum, auto
-from numbers import Integral, Real
 from time import time
-from typing import List, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
+import numpy as np
 from numpy.random import RandomState
 
+from cmdstanpy import _TMPDIR
 from cmdstanpy.utils import (
     cmdstan_path,
-    cmdstan_version_at,
+    cmdstan_version_before,
+    create_named_text_file,
     get_logger,
     read_metric,
+    write_stan_json,
 )
+
+OptionalPath = Union[str, os.PathLike, None]
 
 
 class Method(Enum):
@@ -28,7 +32,7 @@ class Method(Enum):
     LAPLACE = auto()
     PATHFINDER = auto()
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return '<%s.%s>' % (self.__class__.__name__, self.name)
 
 
@@ -55,18 +59,20 @@ class SamplerArgs:
 
     def __init__(
         self,
-        iter_warmup: int = None,
-        iter_sampling: int = None,
+        iter_warmup: Optional[int] = None,
+        iter_sampling: Optional[int] = None,
         save_warmup: bool = False,
-        thin: int = None,
-        max_treedepth: int = None,
-        metric: Union[str, List[str]] = None,
-        step_size: Union[float, List[float]] = None,
+        thin: Optional[int] = None,
+        max_treedepth: Optional[int] = None,
+        metric: Union[
+            str, Dict[str, Any], List[str], List[Dict[str, Any]], None
+        ] = None,
+        step_size: Union[float, List[float], None] = None,
         adapt_engaged: bool = True,
-        adapt_delta: float = None,
-        adapt_init_phase: int = None,
-        adapt_metric_window: int = None,
-        adapt_step_size: int = None,
+        adapt_delta: Optional[float] = None,
+        adapt_init_phase: Optional[int] = None,
+        adapt_metric_window: Optional[int] = None,
+        adapt_step_size: Optional[int] = None,
         fixed_param: bool = False,
         num_chains: int = 1,
     ) -> None:
@@ -77,7 +83,8 @@ class SamplerArgs:
         self.thin = thin
         self.max_treedepth = max_treedepth
         self.metric = metric
-        self.metric_file = None
+        self.metric_type: Optional[str] = None
+        self.metric_file: Union[str, List[str], None] = None
         self.step_size = step_size
         self.adapt_engaged = adapt_engaged
         self.adapt_delta = adapt_delta
@@ -88,7 +95,7 @@ class SamplerArgs:
         self.diagnostic_file = None
         self.num_chains = num_chains
 
-    def validate(self, chains: int) -> None:
+    def validate(self, chains: Optional[int]) -> None:
         """
         Check arguments correctness and consistency.
 
@@ -96,9 +103,9 @@ class SamplerArgs:
         * if file(s) for metric are supplied, check contents.
         * length of per-chain lists equals specified # of chains
         """
-        if not isinstance(chains, Integral) or chains < 1:
+        if not isinstance(chains, (int, np.integer)) or chains < 1:
             raise ValueError(
-                'sampler expects number of chains to be greater than 0'
+                'Sampler expects number of chains to be greater than 0.'
             )
         if not (
             self.adapt_delta is None
@@ -107,7 +114,7 @@ class SamplerArgs:
             and self.adapt_step_size is None
         ):
             if self.adapt_engaged is False:
-                msg = 'conflicting arguments: adapt_engaged: False'
+                msg = 'Conflicting arguments: adapt_engaged: False'
                 if self.adapt_delta is not None:
                     msg = '{}, adapt_delta: {}'.format(msg, self.adapt_delta)
                 if self.adapt_init_phase is not None:
@@ -126,138 +133,204 @@ class SamplerArgs:
 
         if self.iter_warmup is not None:
             if self.iter_warmup < 0 or not isinstance(
-                self.iter_warmup, Integral
+                self.iter_warmup, (int, np.integer)
             ):
                 raise ValueError(
-                    'iter_warmup must be a non-negative integer,'
-                    ' found {}'.format(self.iter_warmup)
+                    'Value for iter_warmup must be a non-negative integer,'
+                    ' found {}.'.format(self.iter_warmup)
                 )
             if self.iter_warmup > 0 and not self.adapt_engaged:
                 raise ValueError(
-                    'adapt_engaged is False, cannot specify warmup iterations'
+                    'Argument "adapt_engaged" is False, '
+                    'cannot specify warmup iterations.'
                 )
         if self.iter_sampling is not None:
             if self.iter_sampling < 0 or not isinstance(
-                self.iter_sampling, Integral
+                self.iter_sampling, (int, np.integer)
             ):
                 raise ValueError(
-                    'iter_sampling must be a non-negative integer,'
-                    ' found {}'.format(self.iter_sampling)
+                    'Argument "iter_sampling" must be a non-negative integer,'
+                    ' found {}.'.format(self.iter_sampling)
                 )
 
         positive_int(self.thin, 'thin')
         positive_int(self.max_treedepth, 'max_treedepth')
 
         if self.step_size is not None:
-            if isinstance(self.step_size, Real):
+            if isinstance(
+                self.step_size, (float, int, np.integer, np.floating)
+            ):
                 if self.step_size <= 0:
                     raise ValueError(
-                        'step_size must be > 0, found {}'.format(self.step_size)
+                        'Argument "step_size" must be > 0, '
+                        'found {}.'.format(self.step_size)
                     )
             else:
                 if len(self.step_size) != chains:
                     raise ValueError(
-                        'number of step_sizes must match number of chains,'
-                        ' found {} step_sizes for {} chains'.format(
-                            len(self.step_size), chains
-                        )
+                        'Expecting {} per-chain step_size specifications, '
+                        ' found {}.'.format(chains, len(self.step_size))
                     )
-                for step_size in self.step_size:
+                for i, step_size in enumerate(self.step_size):
                     if step_size < 0:
                         raise ValueError(
-                            'step_size must be > 0, found {}'.format(step_size)
+                            'Argument "step_size" must be > 0, '
+                            'chain {}, found {}.'.format(i + 1, step_size)
                         )
         if self.metric is not None:
-            dims = []
             if isinstance(self.metric, str):
                 if self.metric in ['diag', 'diag_e']:
-                    self.metric = 'diag_e'
+                    self.metric_type = 'diag_e'
                 elif self.metric in ['dense', 'dense_e']:
-                    self.metric = 'dense_e'
+                    self.metric_type = 'dense_e'
+                elif self.metric in ['unit', 'unit_e']:
+                    self.metric_type = 'unit_e'
                 else:
                     if not os.path.exists(self.metric):
                         raise ValueError('no such file {}'.format(self.metric))
                     dims = read_metric(self.metric)
+                    if len(dims) == 1:
+                        self.metric_type = 'diag_e'
+                    else:
+                        self.metric_type = 'dense_e'
+                    self.metric_file = self.metric
+            elif isinstance(self.metric, dict):
+                if 'inv_metric' not in self.metric:
+                    raise ValueError(
+                        'Entry "inv_metric" not found in metric dict.'
+                    )
+                dims = list(np.asarray(self.metric['inv_metric']).shape)
+                if len(dims) == 1:
+                    self.metric_type = 'diag_e'
+                else:
+                    self.metric_type = 'dense_e'
+                dict_file = create_named_text_file(
+                    dir=_TMPDIR, prefix="metric", suffix=".json"
+                )
+                write_stan_json(dict_file, self.metric)
+                self.metric_file = dict_file
             elif isinstance(self.metric, (list, tuple)):
                 if len(self.metric) != chains:
                     raise ValueError(
-                        'number of metric files must match number of chains,'
-                        ' found {} metric files for {} chains'.format(
+                        'Number of metric files must match number of chains,'
+                        ' found {} metric files for {} chains.'.format(
                             len(self.metric), chains
                         )
                     )
-                names_set = set(self.metric)
-                if len(names_set) != len(self.metric):
-                    raise ValueError(
-                        'each chain must have its own metric file,'
-                        ' found duplicates in metric files list.'
-                    )
-                for i, metric in enumerate(self.metric):
-                    if not os.path.exists(metric):
-                        raise ValueError('no such file {}'.format(metric))
-                    if i == 0:
-                        dims = read_metric(metric)
-                    else:
-                        dims2 = read_metric(metric)
-                        if len(dims) != len(dims2):
+                if all(isinstance(elem, dict) for elem in self.metric):
+                    metric_files: List[str] = []
+                    for i, metric in enumerate(self.metric):
+                        metric_dict: Dict[str, Any] = metric  # type: ignore
+                        if 'inv_metric' not in metric_dict:
                             raise ValueError(
-                                'metrics files {}, {},'
-                                ' inconsistent metrics'.format(
-                                    self.metric[0], metric
-                                )
+                                'Entry "inv_metric" not found in metric dict '
+                                'for chain {}.'.format(i + 1)
                             )
-                        for dim, dim2 in zip(dims, dims2):
-                            if dim != dim2:
+                        if i == 0:
+                            dims = list(
+                                np.asarray(metric_dict['inv_metric']).shape
+                            )
+                        else:
+                            dims2 = list(
+                                np.asarray(metric_dict['inv_metric']).shape
+                            )
+                            if dims != dims2:
                                 raise ValueError(
-                                    'metrics files {}, {},'
+                                    'Found inconsistent "inv_metric" entry '
+                                    'for chain {}: entry has dims '
+                                    '{}, expected {}.'.format(
+                                        i + 1, dims, dims2
+                                    )
+                                )
+                        dict_file = create_named_text_file(
+                            dir=_TMPDIR, prefix="metric", suffix=".json"
+                        )
+                        write_stan_json(dict_file, metric_dict)
+                        metric_files.append(dict_file)
+                    if len(dims) == 1:
+                        self.metric_type = 'diag_e'
+                    else:
+                        self.metric_type = 'dense_e'
+                    self.metric_file = metric_files
+                elif all(isinstance(elem, str) for elem in self.metric):
+                    metric_files = []
+                    for i, metric in enumerate(self.metric):
+                        assert isinstance(metric, str)  # typecheck
+                        if not os.path.exists(metric):
+                            raise ValueError('no such file {}'.format(metric))
+                        if i == 0:
+                            dims = read_metric(metric)
+                        else:
+                            dims2 = read_metric(metric)
+                            if len(dims) != len(dims2):
+                                raise ValueError(
+                                    'Metrics files {}, {},'
                                     ' inconsistent metrics'.format(
                                         self.metric[0], metric
                                     )
                                 )
-            if any(dims):
-                if len(dims) > 2 or (len(dims) == 2 and dims[0] != dims[1]):
-                    raise ValueError('bad metric specifiation')
-                self.metric_file = self.metric
-                if len(dims) == 1:
-                    self.metric = 'diag_e'
-                elif len(dims) == 2:
-                    self.metric = 'dense_e'
+                            if dims != dims2:
+                                raise ValueError(
+                                    'Metrics files {}, {},'
+                                    ' inconsistent metrics'.format(
+                                        self.metric[0], metric
+                                    )
+                                )
+                        metric_files.append(metric)
+                    if len(dims) == 1:
+                        self.metric_type = 'diag_e'
+                    else:
+                        self.metric_type = 'dense_e'
+                    self.metric_file = metric_files
+                else:
+                    raise ValueError(
+                        'Argument "metric" must be a list of pathnames or '
+                        'Python dicts, found list of {}.'.format(
+                            type(self.metric[0])
+                        )
+                    )
+            else:
+                raise ValueError(
+                    'Invalid metric specified, not a recognized metric type, '
+                    'must be either a metric type name, a filepath, dict, '
+                    'or list of per-chain filepaths or dicts.  Found '
+                    'an object of type {}.'.format(type(self.metric))
+                )
+
         if self.adapt_delta is not None:
             if not 0 < self.adapt_delta < 1:
                 raise ValueError(
-                    'adapt_delta must be between 0 and 1,'
+                    'Argument "adapt_delta" must be between 0 and 1,'
                     ' found {}'.format(self.adapt_delta)
                 )
         if self.adapt_init_phase is not None:
             if self.adapt_init_phase < 0 or not isinstance(
-                self.adapt_init_phase, Integral
+                self.adapt_init_phase, (int, np.integer)
             ):
                 raise ValueError(
-                    'adapt_init_phase must be a non-negative integer,'
-                    'found {}'.format(self.adapt_init_phase)
+                    'Argument "adapt_init_phase" must be a non-negative '
+                    'integer, found {}'.format(self.adapt_init_phase)
                 )
         if self.adapt_metric_window is not None:
             if self.adapt_metric_window < 0 or not isinstance(
-                self.adapt_metric_window, Integral
+                self.adapt_metric_window, (int, np.integer)
             ):
                 raise ValueError(
-                    'adapt_metric_window must be a non-negative integer,'
-                    'found {}'.format(self.adapt_metric_window)
+                    'Argument "adapt_metric_window" must be a non-negative '
+                    ' integer, found {}'.format(self.adapt_metric_window)
                 )
         if self.adapt_step_size is not None:
             if self.adapt_step_size < 0 or not isinstance(
-                self.adapt_step_size, Integral
+                self.adapt_step_size, (int, np.integer)
             ):
                 raise ValueError(
-                    'adapt_step_size must be a non-negative integer,'
+                    'Argument "adapt_step_size" must be a non-negative integer,'
                     'found {}'.format(self.adapt_step_size)
                 )
         positive_int(self.num_chains, 'num_chains')
 
         if self.fixed_param and (
-            (self.iter_warmup is not None and self.iter_warmup > 0)
-            or self.save_warmup
-            or self.max_treedepth is not None
+            self.max_treedepth is not None
             or self.metric is not None
             or self.step_size is not None
             or not (
@@ -268,11 +341,10 @@ class SamplerArgs:
             )
         ):
             raise ValueError(
-                'when fixed_param=True, cannot specify warmup'
-                ' or adaptation parameters.'
+                'When fixed_param=True, cannot specify adaptation parameters.'
             )
 
-    def compose(self, idx: int, cmd: List) -> str:
+    def compose(self, idx: int, cmd: List[str]) -> List[str]:
         """
         Compose CmdStan command for method-specific non-default arguments.
         """
@@ -368,10 +440,7 @@ class OptimizeArgs:
         """
         Check arguments correctness and consistency.
         """
-        if (
-            self.algorithm is not None
-            and self.algorithm not in self.OPTIMIZE_ALGOS
-        ):
+        if self.algorithm and self.algorithm not in self.OPTIMIZE_ALGOS:
             raise ValueError(
                 'Please specify optimizer algorithms as one of [{}]'.format(
                     ', '.join(self.OPTIMIZE_ALGOS)
@@ -424,6 +493,8 @@ class OptimizeArgs:
             cmd.append('save_iterations=1')
         if self.jacobian:
             cmd.append("jacobian=1")
+        cmd.append('opencl')
+        cmd.append('num_threads=16')
         return cmd
 
 
@@ -550,7 +621,9 @@ class GenerateQuantitiesArgs:
         """Initialize object."""
         self.sample_csv_files = csv_files
 
-    def validate(self, chains: int) -> None:  # pylint: disable=unused-argument
+    def validate(
+        self, chains: Optional[int] = None  # pylint: disable=unused-argument
+    ) -> None:
         """
         Check arguments correctness and consistency.
 
@@ -562,7 +635,7 @@ class GenerateQuantitiesArgs:
                     'Invalid path for sample csv file: {}'.format(csv)
                 )
 
-    def compose(self, idx: int, cmd: List) -> str:
+    def compose(self, idx: int, cmd: List[str]) -> List[str]:
         """
         Compose CmdStan command for method-specific non-default arguments.
         """
@@ -578,16 +651,16 @@ class VariationalArgs:
 
     def __init__(
         self,
-        algorithm: str = None,
-        iter: int = None,
-        grad_samples: int = None,
-        elbo_samples: int = None,
-        eta: Real = None,
-        adapt_iter: int = None,
+        algorithm: Optional[str] = None,
+        iter: Optional[int] = None,
+        grad_samples: Optional[int] = None,
+        elbo_samples: Optional[int] = None,
+        eta: Optional[float] = None,
+        adapt_iter: Optional[int] = None,
         adapt_engaged: bool = True,
-        tol_rel_obj: Real = None,
-        eval_elbo: int = None,
-        output_samples: int = None,
+        tol_rel_obj: Optional[float] = None,
+        eval_elbo: Optional[int] = None,
+        output_samples: Optional[int] = None,
     ) -> None:
         self.algorithm = algorithm
         self.iter = iter
@@ -600,7 +673,9 @@ class VariationalArgs:
         self.eval_elbo = eval_elbo
         self.output_samples = output_samples
 
-    def validate(self, chains=None) -> None:  # pylint: disable=unused-argument
+    def validate(
+        self, chains: Optional[int] = None  # pylint: disable=unused-argument
+    ) -> None:
         """
         Check arguments correctness and consistency.
         """
@@ -623,7 +698,7 @@ class VariationalArgs:
         positive_int(self.output_samples, 'output_samples')
 
     # pylint: disable=unused-argument
-    def compose(self, idx: int, cmd: List) -> str:
+    def compose(self, idx: int, cmd: List[str]) -> List[str]:
         """
         Compose CmdStan command for method-specific non-default arguments.
         """
@@ -651,8 +726,6 @@ class VariationalArgs:
             cmd.append(f'eval_elbo={self.eval_elbo}')
         if self.output_samples is not None:
             cmd.append(f'output_samples={self.output_samples}')
-        cmd.append('opencl')
-        cmd.append('num_threads=16')
         return cmd
 
 
@@ -666,8 +739,8 @@ class CmdStanArgs:
     def __init__(
         self,
         model_name: str,
-        model_exe: str,
-        chain_ids: Union[List[int], None],
+        model_exe: OptionalPath,
+        chain_ids: Optional[List[int]],
         method_args: Union[
             SamplerArgs,
             OptimizeArgs,
@@ -676,14 +749,14 @@ class CmdStanArgs:
             LaplaceArgs,
             PathfinderArgs,
         ],
-        data: Union[str, dict] = None,
-        seed: Union[int, List[int]] = None,
-        inits: Union[int, float, str, List[str]] = None,
-        output_dir: str = None,
-        sig_figs: str = None,
-        save_diagnostics: bool = False,
-        refresh: str = None,
-        logger: logging.Logger = None,
+        data: Union[Mapping[str, Any], str, None] = None,
+        seed: Union[int, List[int], None] = None,
+        inits: Union[int, float, str, List[str], None] = None,
+        output_dir: OptionalPath = None,
+        sig_figs: Optional[int] = None,
+        save_latent_dynamics: bool = False,
+        save_profile: bool = False,
+        refresh: Optional[int] = None,
     ) -> None:
         """Initialize object."""
         self.model_name = model_name
@@ -694,7 +767,8 @@ class CmdStanArgs:
         self.inits = inits
         self.output_dir = output_dir
         self.sig_figs = sig_figs
-        self.save_diagnostics = save_diagnostics
+        self.save_latent_dynamics = save_latent_dynamics
+        self.save_profile = save_profile
         self.refresh = refresh
         self.method_args = method_args
         if isinstance(method_args, SamplerArgs):
@@ -714,7 +788,6 @@ class CmdStanArgs:
                 'Unsupported method args type: {}'.format(type(method_args))
             )
         #self.method_args.validate(len(chain_ids) if chain_ids else None)
-        self._logger = logger or get_logger()
         #self.validate()
 
     def validate(self) -> None:
@@ -732,11 +805,9 @@ class CmdStanArgs:
             raise ValueError('model not compiled')
 
         if self.chain_ids is not None:
-            for i in range(len(self.chain_ids)):
-                if self.chain_ids[i] < 1:
-                    raise ValueError(
-                        'invalid chain_id {}'.format(self.chain_ids[i])
-                    )
+            for chain_id in self.chain_ids:
+                if chain_id < 1:
+                    raise ValueError('invalid chain_id {}'.format(chain_id))
         if self.output_dir is not None:
             self.output_dir = os.path.realpath(
                 os.path.expanduser(self.output_dir)
@@ -744,18 +815,17 @@ class CmdStanArgs:
             if not os.path.exists(self.output_dir):
                 try:
                     os.makedirs(self.output_dir)
-                    self._logger.info(
+                    get_logger().info(
                         'created output directory: %s', self.output_dir
                     )
                 except (RuntimeError, PermissionError) as exc:
                     raise ValueError(
-                        'invalid path for output files, no such dir: {}'.format(
-                            self.output_dir
-                        )
+                        'Invalid path for output files, '
+                        'no such dir: {}.'.format(self.output_dir)
                     ) from exc
             if not os.path.isdir(self.output_dir):
                 raise ValueError(
-                    'specified output_dir not a directory: {}'.format(
+                    'Specified output_dir is not a directory: {}.'.format(
                         self.output_dir
                     )
                 )
@@ -766,25 +836,35 @@ class CmdStanArgs:
                 os.remove(testpath)  # cleanup
             except Exception as exc:
                 raise ValueError(
-                    'invalid path for output files,'
-                    ' cannot write to dir: {}'.format(self.output_dir)
+                    'Invalid path for output files,'
+                    ' cannot write to dir: {}.'.format(self.output_dir)
                 ) from exc
+        if self.refresh is not None:
+            if (
+                not isinstance(self.refresh, (int, np.integer))
+                or self.refresh < 1
+            ):
+                raise ValueError(
+                    'Argument "refresh" must be a positive integer value, '
+                    'found {}.'.format(self.refresh)
+                )
 
         if self.sig_figs is not None:
             if (
-                not isinstance(self.sig_figs, int)
+                not isinstance(self.sig_figs, (int, np.integer))
                 or self.sig_figs < 1
                 or self.sig_figs > 18
             ):
                 raise ValueError(
-                    'sig_figs must be an integer between 1 and 18,'
+                    'Argument "sig_figs" must be an integer between 1 and 18,'
                     ' found {}'.format(self.sig_figs)
                 )
-            if not cmdstan_version_at(2, 25):
+            # TODO: remove at some future release
+            if cmdstan_version_before(2, 25):
                 self.sig_figs = None
-                self._logger.warning(
-                    'arg sig_figs not valid, CmdStan version must be 2.25 '
-                    'or higher, using verson %s in directory %s',
+                get_logger().warning(
+                    'Argument "sig_figs" invalid for CmdStan versions < 2.25, '
+                    'using version %s in directory %s',
                     os.path.basename(cmdstan_path()),
                     os.path.dirname(cmdstan_path()),
                 )
@@ -793,52 +873,51 @@ class CmdStanArgs:
             rng = RandomState()
             self.seed = rng.randint(1, 99999 + 1)
         else:
-            if not isinstance(self.seed, (int, list)):
+            if not isinstance(self.seed, (int, list, np.integer)):
                 raise ValueError(
-                    'seed must be an integer between 0 and 2**32-1,'
-                    ' found {}'.format(self.seed)
+                    'Argument "seed" must be an integer between '
+                    '0 and 2**32-1, found {}.'.format(self.seed)
                 )
-            if isinstance(self.seed, int):
-                if self.seed < 0 or self.seed > 2 ** 32 - 1:
+            if isinstance(self.seed, (int, np.integer)):
+                if self.seed < 0 or self.seed > 2**32 - 1:
                     raise ValueError(
-                        'seed must be an integer between 0 and 2**32-1,'
-                        ' found {}'.format(self.seed)
+                        'Argument "seed" must be an integer between '
+                        '0 and 2**32-1, found {}.'.format(self.seed)
                     )
             else:
                 if self.chain_ids is None:
                     raise ValueError(
-                        'seed must not be a list when no chains used'
+                        'List of per-chain seeds cannot be evaluated without '
+                        'corresponding list of chain_ids.'
                     )
-
                 if len(self.seed) != len(self.chain_ids):
                     raise ValueError(
-                        'number of seeds must match number of chains,'
-                        ' found {} seed for {} chains '.format(
+                        'Number of seeds must match number of chains,'
+                        ' found {} seed for {} chains.'.format(
                             len(self.seed), len(self.chain_ids)
                         )
                     )
-                for i in range(len(self.seed)):
-                    if self.seed[i] < 0 or self.seed[i] > 2 ** 32 - 1:
+                for seed in self.seed:
+                    if seed < 0 or seed > 2**32 - 1:
                         raise ValueError(
-                            'seed must be an integer value'
+                            'Argument "seed" must be an integer value'
                             ' between 0 and 2**32-1,'
-                            ' found {}'.format(self.seed[i])
+                            ' found {}'.format(seed)
                         )
 
         if isinstance(self.data, str):
             if not os.path.exists(self.data):
                 raise ValueError('no such file {}'.format(self.data))
-        elif self.data is None:
-            if isinstance(self.method_args, OptimizeArgs):
-                raise ValueError('data must be set when optimizing')
-        elif not isinstance(self.data, (str, dict)):
-            raise ValueError('data must be string or dict')
+        elif self.data is not None and not isinstance(self.data, (str, dict)):
+            raise ValueError('Argument "data" must be string or dict')
 
         if self.inits is not None:
-            if isinstance(self.inits, (Integral, Real)):
+            if isinstance(self.inits, (float, int, np.floating, np.integer)):
                 if self.inits < 0:
                     raise ValueError(
-                        'inits must be > 0, found {}'.format(self.inits)
+                        'Argument "inits" must be > 0, found {}'.format(
+                            self.inits
+                        )
                     )
             elif isinstance(self.inits, str):
                 if not (
@@ -850,27 +929,20 @@ class CmdStanArgs:
             elif isinstance(self.inits, list):
                 if self.chain_ids is None:
                     raise ValueError(
-                        'inits must not be a list when no chains are used'
+                        'List of inits files cannot be evaluated without '
+                        'corresponding list of chain_ids.'
                     )
 
                 if len(self.inits) != len(self.chain_ids):
                     raise ValueError(
-                        'number of inits files must match number of chains,'
-                        ' found {} inits files for {} chains '.format(
+                        'Number of inits files must match number of chains,'
+                        ' found {} inits files for {} chains.'.format(
                             len(self.inits), len(self.chain_ids)
                         )
                     )
-                names_set = set(self.inits)
-                if len(names_set) != len(self.inits):
-                    raise ValueError(
-                        'each chain must have its own init file,'
-                        ' found duplicates in inits files list.'
-                    )
-                for i in range(len(self.inits)):
-                    if not os.path.exists(self.inits[i]):
-                        raise ValueError(
-                            'no such file {}'.format(self.inits[i])
-                        )
+                for inits in self.inits:
+                    if not os.path.exists(inits):
+                        raise ValueError('no such file {}'.format(inits))
 
     def compose_command(
         self,
@@ -883,7 +955,7 @@ class CmdStanArgs:
         """
         Compose CmdStan command for non-default arguments.
         """
-        cmd = []
+        cmd: List[str] = []
         if idx is not None and self.chain_ids is not None:
             if idx < 0 or idx > len(self.chain_ids) - 1:
                 raise ValueError(
@@ -894,7 +966,7 @@ class CmdStanArgs:
             cmd.append(self.model_exe)  # type: ignore # guaranteed by validate
             cmd.append(f'id={self.chain_ids[idx]}')
         else:
-            cmd.append(self.model_exe)
+            cmd.append(self.model_exe)  # type: ignore # guaranteed by validate
 
         if self.seed is not None:
             if not isinstance(self.seed, list):
